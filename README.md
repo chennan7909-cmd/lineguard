@@ -1,5 +1,7 @@
 # LineGuard — Autonomous In-Play Risk Desk for TxLINE
 
+![ci](https://github.com/chennan7909-cmd/lineguard/actions/workflows/ci.yml/badge.svg)
+
 > Everyone detects sharp movement. **LineGuard acts on it** — with a closed-form
 > hedge executed the second the spike appears, gated by data-integrity checks,
 > and anchored on Solana so every decision is a checkable claim.
@@ -32,7 +34,7 @@ An autonomous agent can.
     RISK       three-outcome hedge engine. One closed form covers every intent:
         │        h_j = T·p_j,  T = (S+F)/q_i,  q_i = 1 − Σ_{j≠i} 1/o_j
         │      lock_profit floor: F_lock = S(a·q_i − 1)  — exact for ANY
-        ▼      overround, prices the house edge automatically. 24 unit tests.
+        ▼      overround, prices the house edge automatically. 37 tests incl. e2e reliability.
     EXECUTE    full order lifecycle, not a theoretical hedge:
         │        PROPOSED → SUBMITTED → (latency, market moves) →
         │        FILLED / PARTIALLY_FILLED / REJECTED / CANCELLED → RECONCILED
@@ -59,7 +61,7 @@ An autonomous agent can.
     python -m lineguard.results --data data/ --output results/   # canonical results (JSON+CSV+PNG+MD)
     streamlit run lineguard/dashboard.py  # operator panel + explorer links
 
-    pytest -q                             # 24 tests
+    pytest -q                             # 37 tests (unit + reliability + e2e)
 
 ## TxLINE endpoints used
 - `POST /auth/guest/start`, on-chain `subscribe` (Txoracle devnet

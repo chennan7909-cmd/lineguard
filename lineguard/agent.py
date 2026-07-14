@@ -58,9 +58,45 @@ class Desk:
         self.out = out
         self.fh = open(out / "decisions.jsonl", "a", encoding="utf-8")
         self.seen: set = set()
+        self._restore(out / "decisions.jsonl")
+
+    def _restore(self, path: Path):
+        """Rebuild open positions from the decision log (crash/restart recovery).
+        Last state per fixture wins: OPEN/CANCELLED -> open; LOCK/RECONCILED -> locked.
+        Orders pending at crash resolve to open (safe: the desk re-proposes)."""
+        if not path.exists():
+            return
+        last: dict = {}
+        for line in open(path, encoding="utf-8"):
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            fid, act = d.get("fixture"), d.get("action", "")
+            if fid is None:
+                continue
+            if act == "OPEN":
+                last[fid] = ("open", d)
+            elif act in ("LOCK", "RECONCILED"):
+                last[fid] = ("locked", d)
+            elif act == "CANCELLED" and last.get(fid, ("", None))[0] != "locked":
+                last[fid] = ("open", last.get(fid, (None, None))[1] or d)
+        restored = 0
+        for fid, (state, d) in last.items():
+            if state == "locked":
+                self.locked[fid] = {"floor": d.get("locked_pnl", d.get("realized_floor"))}
+            elif state == "open" and d and "outcome_idx" in d:
+                self.positions[fid] = {"pos": Position(d["outcome_idx"], d.get("stake", 100.0), d["odds"]),
+                                       "names": ("part1", "draw", "part2"), "opened": d.get("ts", 0)}
+                restored += 1
+        if restored or self.locked:
+            print(f"[desk] restored from log: {restored} open, {len(self.locked)} locked")
 
     def decide(self, decision: dict):
-        res = self.anchor.anchor(decision)
+        try:
+            res = self.anchor.anchor(decision)
+        except Exception as e:   # anchoring must NEVER break the desk
+            res = {"hash": None, "sig": None, "mode": f"anchor_exception:{type(e).__name__}"}
         decision["anchor"] = res
         self.fh.write(json.dumps(decision, ensure_ascii=False) + "\n")
         self.fh.flush()
@@ -88,8 +124,8 @@ class Desk:
             pos = Position(i, self.stake, u.decimal_odds[i])
             self.positions[fid] = {"pos": pos, "names": u.outcome_names, "opened": u.ts_ms}
             self.decide({"action": "OPEN", "fixture": fid, "ts": u.ts_ms,
-                         "outcome": u.outcome_names[i], "odds": round(pos.entry_odds, 3),
-                         "stake": self.stake,
+                         "outcome": u.outcome_names[i], "outcome_idx": i,
+                         "odds": round(pos.entry_odds, 3), "stake": self.stake,
                          "detail": f"back {u.outcome_names[i]} @ {pos.entry_odds:.3f}"})
             return
 
