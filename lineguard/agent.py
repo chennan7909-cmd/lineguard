@@ -42,7 +42,8 @@ from .txline.normalize import MARKET_1X2, parse_odds, parse_score
 class Desk:
     def __init__(self, out: Path, take: float, stop: float, stake: float, anchor: Anchor,
                  stream_clock: bool, confirm_stop_ms: int = 240_000,
-                 exec_cfg: ExecConfig | None = None, exec_mode: str = "simulated"):
+                 exec_cfg: ExecConfig | None = None, exec_mode: str = "simulated",
+                 verifier=None):
         self.guard = FreshnessGuard(stream_clock=stream_clock)
         self.detector = MovementDetector(DetectorConfig())
         self.anchor = anchor
@@ -53,6 +54,8 @@ class Desk:
         self.executor = SimulatedExecutor(exec_cfg)
         self.pending: dict = {}       # fixture -> Order
         self._repropose_after: dict = {}
+        self.verifier = verifier          # callable(fixture_id, ts, message_id) -> verdict dict
+        self._g6: dict = {}               # fixture -> True/False (cached spot-check)
         self.positions: dict = {}      # fixture -> {pos, opened_ts, names}
         self.locked: dict = {}         # fixture -> plan summary
         self.out = out
@@ -120,6 +123,21 @@ class Desk:
 
         fid = u.fixture_id
         if fid not in self.positions and fid not in self.locked and fid not in self.pending and u.in_running:
+            if self.verifier is not None and fid not in self._g6:
+                try:
+                    v = self.verifier(fid, u.ts_ms, u.message_id)
+                except Exception as e:
+                    v = {"ok": False, "err": f"{type(e).__name__}: {e}"}
+                self._g6[fid] = bool(v.get("ok"))
+                if not self._g6[fid]:
+                    self.decide({"action": "REJECT_G6", "fixture": fid, "ts": u.ts_ms,
+                                 "verdict": v, "detail": "Merkle proof failed on-chain view — fixture quarantined"})
+                else:
+                    self.decide({"action": "G6_VERIFIED", "fixture": fid, "ts": u.ts_ms,
+                                 "pda": v.get("pda"), "units": v.get("units"),
+                                 "detail": f"packet cryptographically anchored (validate_odds view, {v.get('units')} CU)"})
+            if self._g6.get(fid) is False:
+                return
             i = max(range(3), key=lambda k: u.probs[k])
             pos = Position(i, self.stake, u.decimal_odds[i])
             self.positions[fid] = {"pos": pos, "names": u.outcome_names, "opened": u.ts_ms}
@@ -268,6 +286,8 @@ def main():
     ap.add_argument("--exec-fill-prob", type=float, default=0.92)
     ap.add_argument("--exec-liquidity", type=float, default=5000.0)
     ap.add_argument("--exec-seed", type=int, default=7)
+    ap.add_argument("--verify-anchor", action="store_true",
+                    help="G6: cryptographic Merkle spot-check per fixture before opening (validate_odds on-chain view)")
     args = ap.parse_args()
 
     out = Path(args.out); out.mkdir(exist_ok=True)
@@ -276,9 +296,14 @@ def main():
     exec_cfg = ExecConfig(latency_ms=args.exec_latency_ms, max_slippage_bps=args.exec_slippage_bps,
                           fill_probability=args.exec_fill_prob, max_leg_liquidity=args.exec_liquidity,
                           seed=args.exec_seed)
+    verifier = None
+    if args.verify_anchor:
+        from .chain.verify import verify_update
+        creds_v = get_credentials()
+        verifier = lambda fid, ts, mid: verify_update(creds_v, fixture_id=fid, ts=ts, message_id=mid)
     desk = Desk(out, args.take, args.stop, args.stake, anchor, stream_clock=bool(args.replay),
                 confirm_stop_ms=args.confirm_stop_s * 1000 if args.confirm_stop_s > 0 else 0,
-                exec_cfg=exec_cfg, exec_mode=args.exec_mode)
+                exec_cfg=exec_cfg, exec_mode=args.exec_mode, verifier=verifier)
     src = replay_rows(args.replay, args.speed, args.inject_stale) if args.replay else live_rows()
     print(f"[agent] running ({'replay' if args.replay else 'LIVE'}); take={args.take} stop={args.stop}")
     for chan, payload in src:

@@ -24,10 +24,13 @@ An autonomous agent can.
     TxLINE StablePrice (demargined consensus, SSE + 5-min history buckets)
         │
         ▼
-    GUARD      5 integrity checks before ANY decision: freshness, demargin sum,
-        │      Pct↔Prices consistency, range sanity, time monotonicity.
-        │      TxLINE anchors data on-chain; LineGuard verifies on the consumer
-        ▼      side. Fail → decision refused, refusal itself logged + anchored.
+    GUARD      G1–G5 heuristic checks on EVERY packet: freshness, demargin sum,
+        │      Pct↔Prices consistency, range sanity, time monotonicity —
+        │      plus G6, a CRYPTOGRAPHIC spot-check at decision boundaries:
+        │      before opening on a fixture, fetch the Merkle bundle and re-run
+        │      the Txoracle `validate_odds` view on devnet (vendored IDL,
+        │      minimal borsh, ~1.4M CU). Root mismatch → fixture quarantined.
+        ▼      TxLINE anchors the data; LineGuard verifies the anchor. Literally.
     SIGNAL     dual-gate z-score (|z|≥2.5 AND |Δp|≥0.04) with SCORE-EVENT
         │      ATTRIBUTION: moves within 120s of a goal are event-driven;
         ▼      the rest are true sharp moves. (Backtest: 54% vs 40% hit-rate.)
@@ -54,7 +57,7 @@ An autonomous agent can.
     python -m lineguard.agent --replay "data/hist_odds_18222446_*.jsonl" --speed 120
 
     # live during a match
-    python -m lineguard.agent --live
+    python -m lineguard.agent --live --verify-anchor   # G6 Merkle spot-checks on
 
     # research loop
     python -m lineguard.txline.backfill   # 29 matches of history via 5-min buckets
@@ -65,7 +68,7 @@ An autonomous agent can.
 
 | Module | File | What is tested |
 |---|---|---|
-| Guard | `tests/test_guard.py` | stale, malformed sums, Pct↔Prices inconsistency, out-of-order |
+| Guard | `tests/test_guard.py` + `tests/test_chain.py` | stale, malformed sums, Pct↔Prices inconsistency, out-of-order, G6 Merkle quarantine |
 | Signal | `tests/test_signal.py` | z-gate, absolute-move gate, cooldown, goal attribution window |
 | Hedge | `tests/test_hedge.py` | three-way equalized P/L (brute-forced), floors, margin, infeasibility |
 | Execution | `tests/test_execution.py` | latency, slippage, partial fill, rejection, price protection, seed determinism |

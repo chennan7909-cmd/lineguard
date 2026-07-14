@@ -31,3 +31,30 @@ def test_dry_run_signs_but_never_sends():
     assert res["sig"] == "DRY_RUN" and res["hash"]
     os.environ.pop("ANCHOR_MODE"); os.environ.pop("SOLANA_WALLET")
     importlib.reload(m)
+
+
+def test_borsh_encoder_matches_idl_layout():
+    from lineguard.chain.borsh_min import encode
+    assert encode("u16", 20624) == (20624).to_bytes(2, "little")
+    assert encode("string", "ab") == b"\x02\x00\x00\x00ab"
+    assert encode({"option": "string"}, None) == b"\x00"
+    assert encode({"vec": "i32"}, [1862]) == b"\x01\x00\x00\x00" + (1862).to_bytes(4, "little", signed=True)
+
+
+def test_g6_failure_quarantines_fixture(tmp_path):
+    from tests._helpers import decisions, mk_desk, mk_odds
+    desk = mk_desk(tmp_path, verifier=lambda fid, ts, mid: {"ok": False, "err": "root mismatch"})
+    desk.on_odds(mk_odds(5, 1_000_000, (0.44, 0.28, 0.28), "q1"))
+    desk.on_odds(mk_odds(5, 1_060_000, (0.58, 0.22, 0.20), "q2"))
+    acts = [d["action"] for d in decisions(tmp_path)]
+    assert "REJECT_G6" in acts and "OPEN" not in acts
+
+
+def test_g6_pass_verifies_once_then_opens(tmp_path):
+    from tests._helpers import decisions, mk_desk, mk_odds
+    calls = []
+    desk = mk_desk(tmp_path, verifier=lambda fid, ts, mid: (calls.append(fid) or {"ok": True, "units": 1_390_000, "pda": "F2k9"}))
+    desk.on_odds(mk_odds(6, 1_000_000, (0.44, 0.28, 0.28), "v1"))
+    desk.on_odds(mk_odds(6, 1_060_000, (0.45, 0.275, 0.275), "v2"))
+    acts = [d["action"] for d in decisions(tmp_path)]
+    assert acts.count("G6_VERIFIED") == 1 and "OPEN" in acts and calls == [6]
