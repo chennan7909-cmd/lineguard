@@ -1,8 +1,8 @@
 # TxLINE API Feedback (hands-on, devnet free tier)
 
 ## What we liked most
-1. **The 5-minute bucket endpoints are a superpower.** We reconstructed 27
-   complete matches (~1.4M odds updates) via /api/odds/updates/{day}/{hour}/
+1. **The 5-minute bucket endpoints are a superpower.** We reconstructed 29
+   complete matches (2.88M raw odds rows) via /api/odds/updates/{day}/{hour}/
    {interval} in minutes. Historical depth at this granularity, free, is
    something even paid sportsbook APIs rarely offer.
 2. **Demargined StablePrice.** Pct summing to ~100 removes the vig-stripping

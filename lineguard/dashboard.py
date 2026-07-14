@@ -39,7 +39,7 @@ for d in reversed(decisions[-60:]):
         else:
             st.markdown(f"**sha256** `{a.get('hash','')[:32]}…` · anchor: {a.get('mode','-')}")
 
-st.subheader("Evidence: spikes are ephemeral (27-match backtest)")
+st.subheader("Evidence: spikes are ephemeral (canonical backtest — see results/)")
 cpath = DATA / "decay_curve.json"
 if cpath.exists():
     c = json.loads(cpath.read_text())

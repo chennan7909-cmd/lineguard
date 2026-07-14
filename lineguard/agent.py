@@ -7,9 +7,9 @@ Deterministic policy (no LLM in the decision path):
   2. WATCH   every guarded odds update re-prices each open position via the
              one-line identity F_lock = S*(a*q_i - 1).
   3. LOCK    execute the dutch hedge (lock_profit) the moment F_lock crosses
-             +take or -stop bands. Spikes are ephemeral (27-match backtest:
-             unhedged spike value decays -16/100 within 10 min), so the lock
-             is immediate and closed-form.
+             +take or -stop bands. Spikes are ephemeral (canonical backtest,
+             see results/RESULTS.md: avg lockable P/L turns negative within 60s
+             incl. 2% fill margin), so the lock is immediate and closed-form.
   4. REJECT  any update failing the Guard (stale/corrupt) triggers no
              decision and is itself logged + anchored.
 

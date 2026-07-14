@@ -13,10 +13,10 @@ per-signal, decay & equity PNGs):
 
     python -m lineguard.results --data data/ --output results/
 
-Headline: across 27 real World Cup matches (~1.4M TxLINE odds rows), the
-average lockable P/L of a position opened at a spike turns negative within
-60 seconds and keeps decaying — see the decay curve and CI tables in
-`results/`. Spikes are ephemeral; human reaction time cannot capture them.
+Headline: across 29 real World Cup matches (2,876,085 raw TxLINE odds rows (pre-dedup)), the
+average lockable P/L of a position opened at a spike is **−12.5 per 100 stake
+within 60 seconds** (incl. a conservative 2% fill margin) and keeps decaying —
+mean/median/std/95% CI per horizon in `results/`. Spikes are ephemeral; human reaction time cannot capture them.
 An autonomous agent can.
 
 ## What it does
@@ -34,7 +34,7 @@ An autonomous agent can.
     RISK       three-outcome hedge engine. One closed form covers every intent:
         │        h_j = T·p_j,  T = (S+F)/q_i,  q_i = 1 − Σ_{j≠i} 1/o_j
         │      lock_profit floor: F_lock = S(a·q_i − 1)  — exact for ANY
-        ▼      overround, prices the house edge automatically. 37 tests incl. e2e reliability.
+        ▼      overround, prices the house edge automatically. 41 tests incl. e2e.
     EXECUTE    full order lifecycle, not a theoretical hedge:
         │        PROPOSED → SUBMITTED → (latency, market moves) →
         │        FILLED / PARTIALLY_FILLED / REJECTED / CANCELLED → RECONCILED
@@ -57,11 +57,22 @@ An autonomous agent can.
     python -m lineguard.agent --live
 
     # research loop
-    python -m lineguard.txline.backfill   # 27 matches of history via 5-min buckets
+    python -m lineguard.txline.backfill   # 29 matches of history via 5-min buckets
     python -m lineguard.results --data data/ --output results/   # canonical results (JSON+CSV+PNG+MD)
     streamlit run lineguard/dashboard.py  # operator panel + explorer links
 
-    pytest -q                             # 37 tests (unit + reliability + e2e)
+    pytest -q                             # 41 tests, structured by layer:
+
+| Module | File | What is tested |
+|---|---|---|
+| Guard | `tests/test_guard.py` | stale, malformed sums, Pct↔Prices inconsistency, out-of-order |
+| Signal | `tests/test_signal.py` | z-gate, absolute-move gate, cooldown, goal attribution window |
+| Hedge | `tests/test_hedge.py` | three-way equalized P/L (brute-forced), floors, margin, infeasibility |
+| Execution | `tests/test_execution.py` | latency, slippage, partial fill, rejection, price protection, seed determinism |
+| Reconciliation | `tests/test_execution.py` + `tests/test_e2e.py` | realized floor from actual fills, residual/single-leg exposure |
+| Agent (e2e) | `tests/test_e2e.py` | complete replay lifecycle, multi-fixture isolation, restart recovery |
+| Chain | `tests/test_chain.py` | canonical hashing, retry idempotency, offline dry-run |
+| Infra | `tests/test_reliability.py` | SSE reconnect, JWT renewal, dedup, anchor-failure isolation |
 
 ## TxLINE endpoints used
 - `POST /auth/guest/start`, on-chain `subscribe` (Txoracle devnet

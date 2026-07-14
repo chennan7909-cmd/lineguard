@@ -75,6 +75,11 @@ class Anchor:
                 memo.encode(),
                 [AccountMeta(self._kp.pubkey(), is_signer=True, is_writable=False)],
             )
+            if MODE == "dry":   # fully offline: sign against a null blockhash
+                bh = Hash.default()
+                msg = Message.new_with_blockhash([ix], self._kp.pubkey(), bh)
+                Transaction([self._kp], msg, bh)
+                return {"hash": h, "sig": "DRY_RUN", "mode": "dry"}
             import base64
             with httpx.Client(timeout=timeout) as client:
                 last = "?"
@@ -82,8 +87,6 @@ class Anchor:
                     bh = Hash.from_string(self._recent_blockhash(client))
                     msg = Message.new_with_blockhash([ix], self._kp.pubkey(), bh)
                     tx = Transaction([self._kp], msg, bh)
-                    if MODE == "dry":
-                        return {"hash": h, "sig": "DRY_RUN", "mode": "dry"}
                     r = client.post(RPC, json={"jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
                                                "params": [base64.b64encode(bytes(tx)).decode(),
                                                           {"encoding": "base64",

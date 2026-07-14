@@ -6,8 +6,9 @@ LineGuard — Autonomous In-Play Risk Desk for TxLINE
 ## One-liner
 Everyone detects sharp moves; LineGuard acts on them — closed-form hedges
 executed the second a spike appears, gated by data-integrity checks,
-anchored on Solana. Evidence: spikes decay -8/100 within 60s (27-match,
-1.4M-update backtest on real TxLINE data).
+anchored on Solana. Evidence: spikes decay −12.5/100 within 60s incl. 2%
+fill margin (29 real World Cup matches, 2,876,085 raw TxLINE odds rows (pre-dedup); canonical
+figures in results/RESULTS.md, one command to reproduce).
 
 ## Description (short)
 LineGuard is a fully autonomous paper-trading risk desk for World Cup 1X2
