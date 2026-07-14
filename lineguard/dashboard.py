@@ -28,7 +28,9 @@ col4.metric("Anchored on Solana", len(anchored))
 st.subheader("Decision log")
 for d in reversed(decisions[-60:]):
     a = d.get("anchor") or {}
-    icon = {"OPEN": "🟢", "LOCK": "🔒"}.get(d["action"], "🛑")
+    icon = {"OPEN": "🟢", "LOCK": "🔒", "PROPOSED": "📝", "SUBMITTED": "📤",
+            "FILLED": "✅", "PARTIALLY_FILLED": "◑", "NO_FILL": "❌", "QUOTE_HALT": "⏸️",
+            "RECONCILED": "⚖️", "HOLD": "✋"}.get(d["action"], "🛑")
     with st.expander(f"{icon} {d['action']}  ·  fixture {d.get('fixture')}  ·  {d.get('detail','')}"):
         st.json({k: v for k, v in d.items() if k != "anchor"})
         if a.get("sig") and a["sig"] != "DRY_RUN":

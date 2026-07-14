@@ -46,6 +46,16 @@ score-event attribution: goal-driven vs true sharp — 54% vs 40% hit rate)
 - GET /api/odds/updates/{day}/{hour}/{interval} and
   GET /api/scores/updates/{day}/{hour}/{interval} (historical backfill)
 
+## Execution lifecycle (Production Readiness)
+LineGuard does not merely calculate a theoretical hedge. Every trigger runs a
+full simulated-execution lifecycle — PROPOSED -> SUBMITTED -> (800ms latency,
+market moves) -> FILLED / PARTIALLY_FILLED / REJECTED / CANCELLED ->
+RECONCILED — against a venue simulator with seeded, deterministic frictions
+(<=75bps slippage, 92% fill probability, per-leg liquidity caps, quote halts,
+one retry). Reconciliation recomputes the realized floor from actual fills,
+so partial fills and single-leg risk are measured and anchored, not assumed
+away. Swapping the simulator for a real venue adapter changes one class.
+
 ## Business angle
 The risk layer is strategy-agnostic and venue-agnostic: any trading team or
 B2B odds intermediary holding in-play exposure can bolt LineGuard onto their

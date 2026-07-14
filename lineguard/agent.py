@@ -31,6 +31,7 @@ from pathlib import Path
 import httpx
 
 from .chain.anchor import Anchor
+from .execution import ExecConfig, SimulatedExecutor
 from .guard.freshness import FreshnessGuard
 from .risk.hedge import Position, lock_profit, locked_pnl
 from .signal.detector import DetectorConfig, MovementDetector
@@ -40,13 +41,17 @@ from .txline.normalize import MARKET_1X2, parse_odds, parse_score
 
 class Desk:
     def __init__(self, out: Path, take: float, stop: float, stake: float, anchor: Anchor,
-                 stream_clock: bool, confirm_stop_ms: int = 240_000):
+                 stream_clock: bool, confirm_stop_ms: int = 240_000,
+                 exec_cfg: ExecConfig | None = None, exec_mode: str = "simulated"):
         self.guard = FreshnessGuard(stream_clock=stream_clock)
         self.detector = MovementDetector(DetectorConfig())
         self.anchor = anchor
         self.take, self.stop, self.stake = take, stop, stake
         self.confirm_stop_ms = confirm_stop_ms
         self._held_through: dict = {}
+        self.exec_mode = exec_mode
+        self.executor = SimulatedExecutor(exec_cfg)
+        self.pending: dict = {}       # fixture -> Order
         self.positions: dict = {}      # fixture -> {pos, opened_ts, names}
         self.locked: dict = {}         # fixture -> plan summary
         self.out = out
@@ -77,7 +82,7 @@ class Desk:
         self.detector.on_odds(u)   # keeps attribution state warm
 
         fid = u.fixture_id
-        if fid not in self.positions and fid not in self.locked and u.in_running:
+        if fid not in self.positions and fid not in self.locked and fid not in self.pending and u.in_running:
             i = max(range(3), key=lambda k: u.probs[k])
             pos = Position(i, self.stake, u.decimal_odds[i])
             self.positions[fid] = {"pos": pos, "names": u.outcome_names, "opened": u.ts_ms}
@@ -85,6 +90,23 @@ class Desk:
                          "outcome": u.outcome_names[i], "odds": round(pos.entry_odds, 3),
                          "stake": self.stake,
                          "detail": f"back {u.outcome_names[i]} @ {pos.entry_odds:.3f}"})
+            return
+
+        pend = self.pending.get(fid)
+        if pend:
+            order, pst = pend
+            for ev in self.executor.poll(order, u.decimal_odds, u.ts_ms):
+                self.decide({"action": ev.get("event", ev.get("state", "FILL_EVENT")),
+                             "fixture": fid, "ts": u.ts_ms, **ev,
+                             "detail": f"leg->{ev['leg']} {ev.get('state', ev.get('event'))}"})
+            if order.state == "SETTLED":
+                rec = self.executor.reconcile(order)
+                self.locked[fid] = {"floor": rec["realized_floor"]}
+                del self.pending[fid]
+                self.decide({"action": "RECONCILED", "fixture": fid, "ts": u.ts_ms, **rec,
+                             "detail": (f"realized_floor={rec['realized_floor']:+.2f} vs "
+                                        f"proposed={rec['proposed_floor']:+.2f} "
+                                        f"(friction {rec['friction_cost']:+.2f})")})
             return
 
         st = self.positions.get(fid)
@@ -104,15 +126,28 @@ class Desk:
                 return
         if f >= self.take or f <= self.stop:
             plan = lock_profit(pos, u.decimal_odds)
-            self.locked[fid] = {"floor": plan.floor}
+            reason = 'take' if f >= self.take else 'stop'
+            if self.exec_mode == "instant":
+                self.locked[fid] = {"floor": plan.floor}
+                del self.positions[fid]
+                self.decide({"action": "LOCK", "fixture": fid, "ts": u.ts_ms,
+                             "outcome": st["names"][pos.outcome],
+                             "hedge_stakes": [round(h, 2) for h in plan.hedge_stakes],
+                             "locked_pnl": round(plan.floor, 2),
+                             "detail": f"F_lock={plan.floor:+.2f} ({reason})"})
+                return
+            order = self.executor.submit(fid, pos, plan, u.ts_ms)
+            self.pending[fid] = (order, st)
             del self.positions[fid]
-            self.decide({"action": "LOCK", "fixture": fid, "ts": u.ts_ms,
-                         "outcome": st["names"][pos.outcome],
-                         "entry_odds": round(pos.entry_odds, 3),
-                         "odds_now": [round(o, 3) for o in u.decimal_odds],
+            self.decide({"action": "PROPOSED", "fixture": fid, "ts": u.ts_ms,
+                         "intent": plan.intent, "reason": reason,
+                         "proposed_floor": round(plan.floor, 2),
                          "hedge_stakes": [round(h, 2) for h in plan.hedge_stakes],
-                         "locked_pnl": round(plan.floor, 2),
-                         "detail": f"F_lock={plan.floor:+.2f} ({'take' if f >= self.take else 'stop'})"})
+                         "exec_config": self.executor.cfg.as_dict(),
+                         "detail": f"F_lock={plan.floor:+.2f} ({reason}) -> hedge proposed"})
+            self.decide({"action": "SUBMITTED", "fixture": fid, "ts": u.ts_ms,
+                         "legs": [{"outcome": l.outcome, "stake": round(l.requested, 2)} for l in order.legs],
+                         "detail": f"{len(order.legs)} leg(s) to venue (latency {self.executor.cfg.latency_ms}ms)"})
 
 
 def replay_rows(patterns, speed, inject_stale=False):
@@ -180,13 +215,23 @@ def main():
     ap.add_argument("--inject-stale", action="store_true", help="demo: inject one stale packet mid-stream")
     ap.add_argument("--confirm-stop-s", type=int, default=240,
                     help="stop only if a score event occurred within this window (0 = always stop)")
+    ap.add_argument("--exec-mode", choices=["simulated", "instant"], default="simulated")
+    ap.add_argument("--exec-latency-ms", type=int, default=800)
+    ap.add_argument("--exec-slippage-bps", type=int, default=75)
+    ap.add_argument("--exec-fill-prob", type=float, default=0.92)
+    ap.add_argument("--exec-liquidity", type=float, default=5000.0)
+    ap.add_argument("--exec-seed", type=int, default=7)
     args = ap.parse_args()
 
     out = Path(args.out); out.mkdir(exist_ok=True)
     anchor = Anchor()
     print(f"[agent] anchor: {'ON pubkey=' + anchor.pubkey if anchor.enabled else getattr(anchor, 'reason', 'off')}")
+    exec_cfg = ExecConfig(latency_ms=args.exec_latency_ms, max_slippage_bps=args.exec_slippage_bps,
+                          fill_probability=args.exec_fill_prob, max_leg_liquidity=args.exec_liquidity,
+                          seed=args.exec_seed)
     desk = Desk(out, args.take, args.stop, args.stake, anchor, stream_clock=bool(args.replay),
-                confirm_stop_ms=args.confirm_stop_s * 1000 if args.confirm_stop_s > 0 else 0)
+                confirm_stop_ms=args.confirm_stop_s * 1000 if args.confirm_stop_s > 0 else 0,
+                exec_cfg=exec_cfg, exec_mode=args.exec_mode)
     src = replay_rows(args.replay, args.speed, args.inject_stale) if args.replay else live_rows()
     print(f"[agent] running ({'replay' if args.replay else 'LIVE'}); take={args.take} stop={args.stop}")
     for chan, payload in src:
@@ -201,6 +246,8 @@ def main():
     print("[agent] stream ended")
     for fid, st in desk.positions.items():
         print(f"[agent] still open: fx={fid} {st['names'][st['pos'].outcome]}")
+    for fid in desk.pending:
+        print(f"[agent] order pending at stream end: fx={fid}")
 
 
 if __name__ == "__main__":
