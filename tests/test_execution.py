@@ -60,3 +60,26 @@ def test_rejection_leaves_single_leg_risk_visible():
     rec = exe.reconcile(order)
     assert all(l.state == "REJECTED" for l in order.legs)
     assert rec["realized_floor"] <= -100.0 + 0.01   # naked position: losing states lose the stake
+
+
+def test_price_protection_cancels_on_adverse_move():
+    exe = SimulatedExecutor(ExecConfig(seed=13, fill_probability=1.0, quote_halt_prob=0.0,
+                                       price_protection_bps=150))
+    pos = Position(0, 100.0, 2.4)
+    plan = lock_profit(pos, ODDS)
+    order = exe.submit(1, pos, plan, ts_ms=1_000_000, odds_at_proposal=ODDS)
+    crashed = (1.4, 2.9, 3.8)   # both hedge legs' odds shortened >150bps
+    exe.poll(order, crashed, 2_000_000)
+    assert order.state == "SETTLED_UNFILLED"
+    assert all(l.state == "CANCELLED" and l.filled == 0 for l in order.legs)
+
+
+def test_within_band_still_fills():
+    exe = SimulatedExecutor(ExecConfig(seed=17, fill_probability=1.0, quote_halt_prob=0.0,
+                                       max_slippage_bps=0, price_protection_bps=150))
+    pos = Position(0, 100.0, 2.4)
+    plan = lock_profit(pos, ODDS)
+    order = exe.submit(1, pos, plan, ts_ms=1_000_000, odds_at_proposal=ODDS)
+    exe.poll(order, ODDS, 2_000_000)   # unchanged odds -> inside band
+    assert order.state == "SETTLED"
+    assert all(l.state == "FILLED" for l in order.legs)

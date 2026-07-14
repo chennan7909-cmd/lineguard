@@ -52,6 +52,7 @@ class Desk:
         self.exec_mode = exec_mode
         self.executor = SimulatedExecutor(exec_cfg)
         self.pending: dict = {}       # fixture -> Order
+        self._repropose_after: dict = {}
         self.positions: dict = {}      # fixture -> {pos, opened_ts, names}
         self.locked: dict = {}         # fixture -> plan summary
         self.out = out
@@ -99,6 +100,14 @@ class Desk:
                 self.decide({"action": ev.get("event", ev.get("state", "FILL_EVENT")),
                              "fixture": fid, "ts": u.ts_ms, **ev,
                              "detail": f"leg->{ev['leg']} {ev.get('state', ev.get('event'))}"})
+            if order.state == "SETTLED_UNFILLED":
+                self.positions[fid] = pst
+                del self.pending[fid]
+                self._repropose_after[fid] = u.ts_ms + 120_000
+                self.decide({"action": "CANCELLED", "fixture": fid, "ts": u.ts_ms,
+                             "detail": "no leg filled (price protection / rejects) — "
+                                       "position returned to book, re-propose after 120s"})
+                return
             if order.state == "SETTLED":
                 rec = self.executor.reconcile(order)
                 self.locked[fid] = {"floor": rec["realized_floor"]}
@@ -124,6 +133,8 @@ class Desk:
                                  "detail": f"F_lock={f:+.2f} < stop but unattributed (no score event "
                                            f"within {self.confirm_stop_ms//1000}s) — spikes revert, holding"})
                 return
+        if u.ts_ms < self._repropose_after.get(fid, 0):
+            return
         if f >= self.take or f <= self.stop:
             plan = lock_profit(pos, u.decimal_odds)
             reason = 'take' if f >= self.take else 'stop'
@@ -136,7 +147,7 @@ class Desk:
                              "locked_pnl": round(plan.floor, 2),
                              "detail": f"F_lock={plan.floor:+.2f} ({reason})"})
                 return
-            order = self.executor.submit(fid, pos, plan, u.ts_ms)
+            order = self.executor.submit(fid, pos, plan, u.ts_ms, odds_at_proposal=u.decimal_odds)
             self.pending[fid] = (order, st)
             del self.positions[fid]
             self.decide({"action": "PROPOSED", "fixture": fid, "ts": u.ts_ms,

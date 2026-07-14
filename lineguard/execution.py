@@ -35,6 +35,7 @@ class ExecConfig:
     max_leg_liquidity: float = 5000.0
     quote_halt_prob: float = 0.03
     max_retries: int = 1
+    price_protection_bps: int = 150   # cancel a leg if its odds worsen beyond this vs proposal
     seed: int = 7
 
     def as_dict(self):
@@ -45,6 +46,7 @@ class ExecConfig:
 class Leg:
     outcome: int
     requested: float
+    proposal_odds: float = 0.0
     filled: float = 0.0
     fill_odds: float = 0.0
     state: str = "SUBMITTED"
@@ -67,8 +69,9 @@ class SimulatedExecutor:
         self.cfg = cfg or ExecConfig()
         self._rng = random.Random(self.cfg.seed)
 
-    def submit(self, fixture: int, pos, plan, ts_ms: int) -> Order:
-        legs = [Leg(j, stake) for j, stake in enumerate(plan.hedge_stakes) if stake > 1e-9]
+    def submit(self, fixture: int, pos, plan, ts_ms: int, odds_at_proposal=None) -> Order:
+        legs = [Leg(j, stake, odds_at_proposal[j] if odds_at_proposal else 0.0)
+                for j, stake in enumerate(plan.hedge_stakes) if stake > 1e-9]
         return Order(fixture, pos, plan.floor, plan.intent, ts_ms, legs)
 
     def poll(self, order: Order, odds_now, ts_ms: int) -> list[dict]:
@@ -80,6 +83,16 @@ class SimulatedExecutor:
             if leg.state not in ("SUBMITTED", "RETRY"):
                 continue
             leg.attempts += 1
+            if leg.proposal_odds > 1:
+                protected_min = 1 + (leg.proposal_odds - 1) * (1 - self.cfg.price_protection_bps / 10_000)
+                if odds_now[leg.outcome] < protected_min:
+                    leg.state = "CANCELLED"
+                    events.append({"leg": leg.outcome, "event": "PRICE_PROTECTION",
+                                   "state": "CANCELLED",
+                                   "proposal_odds": round(leg.proposal_odds, 3),
+                                   "odds_now": round(odds_now[leg.outcome], 3),
+                                   "limit_bps": self.cfg.price_protection_bps})
+                    continue
             if self._rng.random() < self.cfg.quote_halt_prob:
                 leg.state = "RETRY" if leg.attempts <= self.cfg.max_retries else "CANCELLED"
                 events.append({"leg": leg.outcome, "event": "QUOTE_HALT",
@@ -101,6 +114,8 @@ class SimulatedExecutor:
                            "fill_odds": round(leg.fill_odds, 3), "slippage_bps": round(slip * 10_000, 1)})
         if all(l.state in ("FILLED", "PARTIALLY_FILLED", "REJECTED", "CANCELLED") for l in order.legs):
             order.state = "SETTLED"
+            if all(l.filled <= 1e-9 for l in order.legs):
+                order.state = "SETTLED_UNFILLED"
         return events
 
     @staticmethod
