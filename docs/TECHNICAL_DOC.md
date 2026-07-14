@@ -1,0 +1,53 @@
+# LineGuard — Brief Technical Documentation
+
+## Core idea
+Every submission in this track can detect a sharp move. Almost none can *act*
+on one. Our 27-match backtest over 1.4M real TxLINE odds updates shows why
+acting matters: a position opened at a spike and left unhedged loses **-8.2
+per 100 stake within 60 seconds** and **-14 within 15 minutes** on average.
+Spikes are ephemeral; human reaction time cannot capture them.
+
+LineGuard is an autonomous in-play **risk desk**: it holds paper positions on
+World Cup 1X2 markets and, the instant the market moves, re-prices every
+position with a closed-form hedge and executes a dutching lock — gated by
+five data-integrity checks and anchored on Solana devnet.
+
+## The mathematics (deterministic, no LLM in the decision path)
+For a stake S on outcome i entered at decimal odds a, with current odds
+(o1,o2,o3), every hedging intent reduces to one closed form:
+
+    h_j = T·p_j   (j≠i),   T = (S+F)/q_i,   q_i = 1 − Σ_{j≠i} 1/o_j
+
+where F is the guaranteed net P/L in every losing state. Setting the win
+state equal gives the lock-profit floor **F_lock = S(a·q_i − 1)** — exact for
+any overround (q_i automatically prices the house edge). Position management
+reduces to watching one observable, a·q_i(t). 18 unit tests include
+brute-force verification of terminal P/L equality across all three outcomes.
+
+## Pipeline
+ingest (SSE odds+scores, reconnect w/ JWT renewal; replay mode for judging)
+→ **Guard** (freshness ≤90s, demargin sum, Pct↔Prices consistency, range,
+time monotonicity — fail ⇒ decision refused, refusal itself anchored)
+→ **Signal** (dual-gate z-score, |z|≥2.5 ∧ |Δp|≥0.04, cooldown, plus
+score-event attribution: goal-driven vs true sharp — 54% vs 40% hit rate)
+→ **Risk** (closed-form desk: OPEN at kickoff, LOCK at take/stop bands)
+→ **Anchor** (sha256 of each decision as an SPL Memo, agent's own wallet).
+
+## TxLINE endpoints used
+- POST /auth/guest/start · on-chain `subscribe` (Txoracle devnet
+  6pW64gN1s2uqjHkn1unFeEjAwJkPGHoppGvS715wyP2J) · POST /api/token/activate
+- GET /api/odds/stream, GET /api/scores/stream (SSE)
+- GET /api/fixtures/snapshot?competitionId=72&startEpochDay={day}
+- GET /api/odds/updates/{day}/{hour}/{interval} and
+  GET /api/scores/updates/{day}/{hour}/{interval} (historical backfill)
+
+## Business angle
+The risk layer is strategy-agnostic and venue-agnostic: any trading team or
+B2B odds intermediary holding in-play exposure can bolt LineGuard onto their
+book. The demargined StablePrice feed makes the closed forms exact; a
+`margin` parameter models conservative fills for real venues.
+
+## Honest limitations
+Paper positions only — no real bets, no custody, no venue execution.
+The entry policy (back the favorite at kickoff) is deliberately simple;
+the product is the risk layer, not the alpha.

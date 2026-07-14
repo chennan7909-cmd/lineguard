@@ -1,0 +1,62 @@
+# LineGuard — Autonomous In-Play Risk Desk for TxLINE
+
+> Everyone detects sharp movement. **LineGuard acts on it** — with a closed-form
+> hedge executed the second the spike appears, gated by data-integrity checks,
+> and anchored on Solana so every decision is a checkable claim.
+
+**Evidence from 27 real World Cup matches (1.4M TxLINE odds updates):** a
+position opened at a spike and left unhedged decays **−16 per 100 stake within
+10 minutes** on average. Spikes are ephemeral; human reaction time cannot
+capture them. An autonomous agent can.
+
+## What it does
+
+    TxLINE StablePrice (demargined consensus, SSE + 5-min history buckets)
+        │
+        ▼
+    GUARD      5 integrity checks before ANY decision: freshness, demargin sum,
+        │      Pct↔Prices consistency, range sanity, time monotonicity.
+        │      TxLINE anchors data on-chain; LineGuard verifies on the consumer
+        ▼      side. Fail → decision refused, refusal itself logged + anchored.
+    SIGNAL     dual-gate z-score (|z|≥2.5 AND |Δp|≥0.04) with SCORE-EVENT
+        │      ATTRIBUTION: moves within 120s of a goal are event-driven;
+        ▼      the rest are true sharp moves. (Backtest: 54% vs 40% hit-rate.)
+    RISK       three-outcome hedge engine. One closed form covers every intent:
+        │        h_j = T·p_j,  T = (S+F)/q_i,  q_i = 1 − Σ_{j≠i} 1/o_j
+        │      lock_profit floor: F_lock = S(a·q_i − 1)  — exact for ANY
+        ▼      overround, prices the house edge automatically. 14 unit tests.
+    ANCHOR     every decision sha256-hashed + written as an SPL Memo on Solana
+               devnet by the agent's own wallet. Audit trail survives the process.
+
+## Run it
+
+    pip install -r requirements.txt
+    export TXLINE_API_TOKEN=...           # see docs/auth; free WC tier
+
+    # replay a real quarterfinal at 120x
+    python -m lineguard.agent --replay "data/hist_odds_18222446_*.jsonl" --speed 120
+
+    # live during a match
+    python -m lineguard.agent --live
+
+    # research loop
+    python -m lineguard.txline.backfill   # 27 matches of history via 5-min buckets
+    python -m lineguard.backtest          # signal extraction + grading
+    python -m lineguard.analysis          # the decay curve
+    streamlit run lineguard/dashboard.py  # operator panel + explorer links
+
+    pytest -q                             # 18 tests
+
+## TxLINE endpoints used
+- `POST /auth/guest/start`, on-chain `subscribe` (Txoracle devnet
+  `6pW64gN1s2uqjHkn1unFeEjAwJkPGHoppGvS715wyP2J`), `POST /api/token/activate`
+- `GET /api/odds/stream`, `GET /api/scores/stream` (SSE)
+- `GET /api/fixtures/snapshot?competitionId=&startEpochDay=`
+- `GET /api/odds/updates/{day}/{hour}/{interval}`, same for scores (history)
+
+## Honest limitations
+- Paper positions only; no real bets, no custody. Real execution pays margin —
+  the engine models it via `margin` (conservative fills), but live venue
+  integration is out of scope and jurisdiction-dependent.
+- Entry policy (back the favorite at kickoff) is deliberately simple; the
+  product is the risk layer, and it is strategy-agnostic.

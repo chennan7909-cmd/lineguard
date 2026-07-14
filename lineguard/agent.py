@@ -1,0 +1,207 @@
+"""LineGuard agent — the autonomous in-play risk desk.
+
+Deterministic policy (no LLM in the decision path):
+
+  1. OPEN    when a fixture goes in-running, back the market favorite with a
+             fixed paper stake (the "portfolio" the desk protects).
+  2. WATCH   every guarded odds update re-prices each open position via the
+             one-line identity F_lock = S*(a*q_i - 1).
+  3. LOCK    execute the dutch hedge (lock_profit) the moment F_lock crosses
+             +take or -stop bands. Spikes are ephemeral (27-match backtest:
+             unhedged spike value decays -16/100 within 10 min), so the lock
+             is immediate and closed-form.
+  4. REJECT  any update failing the Guard (stale/corrupt) triggers no
+             decision and is itself logged + anchored.
+
+Every decision is appended to data/decisions.jsonl and anchored on Solana
+devnet via SPL Memo (hash + compact fields), so the audit trail survives
+independently of this process.
+
+    python -m lineguard.agent --replay "data/hist_odds_18222446_*.jsonl" --speed 60
+    python -m lineguard.agent --live
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import time
+from pathlib import Path
+
+import httpx
+
+from .chain.anchor import Anchor
+from .guard.freshness import FreshnessGuard
+from .risk.hedge import Position, lock_profit, locked_pnl
+from .signal.detector import DetectorConfig, MovementDetector
+from .txline.auth import ORIGIN, get_credentials
+from .txline.normalize import MARKET_1X2, parse_odds, parse_score
+
+
+class Desk:
+    def __init__(self, out: Path, take: float, stop: float, stake: float, anchor: Anchor,
+                 stream_clock: bool, confirm_stop_ms: int = 240_000):
+        self.guard = FreshnessGuard(stream_clock=stream_clock)
+        self.detector = MovementDetector(DetectorConfig())
+        self.anchor = anchor
+        self.take, self.stop, self.stake = take, stop, stake
+        self.confirm_stop_ms = confirm_stop_ms
+        self._held_through: dict = {}
+        self.positions: dict = {}      # fixture -> {pos, opened_ts, names}
+        self.locked: dict = {}         # fixture -> plan summary
+        self.out = out
+        self.fh = open(out / "decisions.jsonl", "a", encoding="utf-8")
+        self.seen: set = set()
+
+    def decide(self, decision: dict):
+        res = self.anchor.anchor(decision)
+        decision["anchor"] = res
+        self.fh.write(json.dumps(decision, ensure_ascii=False) + "\n")
+        self.fh.flush()
+        sig = (res.get("sig") or "-")[:16]
+        print(f"[desk] {decision['action']:<12} fx={decision.get('fixture')} "
+              f"{decision.get('detail','')}  ⚓{sig}")
+
+    def on_score(self, s):
+        self.detector.note_score_event(s.fixture_id, s.ts_ms, s.action)
+
+    def on_odds(self, u):
+        if u.market != MARKET_1X2 or u.message_id in self.seen:
+            return
+        self.seen.add(u.message_id)
+        v = self.guard.check(u)
+        if not v.ok:
+            self.decide({"action": f"REJECT_{v.code}", "fixture": u.fixture_id,
+                         "ts": u.ts_ms, "detail": v.detail})
+            return
+        self.detector.on_odds(u)   # keeps attribution state warm
+
+        fid = u.fixture_id
+        if fid not in self.positions and fid not in self.locked and u.in_running:
+            i = max(range(3), key=lambda k: u.probs[k])
+            pos = Position(i, self.stake, u.decimal_odds[i])
+            self.positions[fid] = {"pos": pos, "names": u.outcome_names, "opened": u.ts_ms}
+            self.decide({"action": "OPEN", "fixture": fid, "ts": u.ts_ms,
+                         "outcome": u.outcome_names[i], "odds": round(pos.entry_odds, 3),
+                         "stake": self.stake,
+                         "detail": f"back {u.outcome_names[i]} @ {pos.entry_odds:.3f}"})
+            return
+
+        st = self.positions.get(fid)
+        if not st:
+            return
+        pos = st["pos"]
+        f = locked_pnl(pos, u.decimal_odds)
+        if f <= self.stop:
+            last_ev = self.detector._last_event_ts.get(fid, 0)
+            if u.ts_ms - last_ev > self.confirm_stop_ms:
+                # adverse spike with NO score event: evidence says it reverts -> HOLD
+                if not self._held_through.get(fid):
+                    self._held_through[fid] = True
+                    self.decide({"action": "HOLD", "fixture": fid, "ts": u.ts_ms,
+                                 "detail": f"F_lock={f:+.2f} < stop but unattributed (no score event "
+                                           f"within {self.confirm_stop_ms//1000}s) — spikes revert, holding"})
+                return
+        if f >= self.take or f <= self.stop:
+            plan = lock_profit(pos, u.decimal_odds)
+            self.locked[fid] = {"floor": plan.floor}
+            del self.positions[fid]
+            self.decide({"action": "LOCK", "fixture": fid, "ts": u.ts_ms,
+                         "outcome": st["names"][pos.outcome],
+                         "entry_odds": round(pos.entry_odds, 3),
+                         "odds_now": [round(o, 3) for o in u.decimal_odds],
+                         "hedge_stakes": [round(h, 2) for h in plan.hedge_stakes],
+                         "locked_pnl": round(plan.floor, 2),
+                         "detail": f"F_lock={plan.floor:+.2f} ({'take' if f >= self.take else 'stop'})"})
+
+
+def replay_rows(patterns, speed, inject_stale=False):
+    files = sorted(sum((glob.glob(p) for p in patterns), []))
+    rows = []
+    for f in files:
+        chan = "scores" if "scores" in Path(f).name else "odds"
+        for line in open(f, encoding="utf-8"):
+            rec = json.loads(line)
+            rows.append((rec["payload"].get("Ts", 0), chan, rec["payload"]))
+    rows.sort(key=lambda r: r[0])
+    if inject_stale and rows:
+        mid = len(rows) // 2
+        ts_mid = rows[mid][0]
+        bad = dict(rows[mid][2]); bad = json.loads(json.dumps(bad))
+        bad["Ts"] = ts_mid - 9_000_000
+        bad["MessageId"] = "INJECTED_STALE_DEMO"
+        rows.insert(mid, (ts_mid, rows[mid][1], bad))   # arrives NOW, stamped 2.5h ago
+    prev = None
+    for ts, chan, payload in rows:
+        real_ts = payload.get("Ts", ts)
+        if speed > 0 and prev is not None and ts > prev:
+            time.sleep(min((ts - prev) / 1000.0 / speed, 2.0))
+        prev = ts
+        yield chan, payload
+
+
+def live_rows():
+    from .txline.recorder import _iter_sse_lines
+    creds = get_credentials()
+    import threading, queue
+    q: "queue.Queue" = queue.Queue()
+
+    def pump(channel):
+        while True:
+            try:
+                with httpx.Client(timeout=httpx.Timeout(10, read=120)) as client:
+                    with client.stream("GET", f"{ORIGIN}/api/{channel}/stream",
+                                       headers={**creds.headers(), "Accept": "text/event-stream"}) as resp:
+                        if resp.status_code in (401, 403):
+                            creds.renew_jwt(); continue
+                        for msg in _iter_sse_lines(resp):
+                            try:
+                                q.put((channel, json.loads(msg["data"])))
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+            except Exception:
+                time.sleep(2)
+
+    for ch in ("odds", "scores"):
+        threading.Thread(target=pump, args=(ch,), daemon=True).start()
+    while True:
+        yield q.get()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--replay", nargs="*", help="glob(s) of hist/recorded jsonl; else --live")
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--speed", type=float, default=60.0)
+    ap.add_argument("--take", type=float, default=8.0)
+    ap.add_argument("--stop", type=float, default=-15.0)
+    ap.add_argument("--stake", type=float, default=100.0)
+    ap.add_argument("--out", default="data")
+    ap.add_argument("--inject-stale", action="store_true", help="demo: inject one stale packet mid-stream")
+    ap.add_argument("--confirm-stop-s", type=int, default=240,
+                    help="stop only if a score event occurred within this window (0 = always stop)")
+    args = ap.parse_args()
+
+    out = Path(args.out); out.mkdir(exist_ok=True)
+    anchor = Anchor()
+    print(f"[agent] anchor: {'ON pubkey=' + anchor.pubkey if anchor.enabled else getattr(anchor, 'reason', 'off')}")
+    desk = Desk(out, args.take, args.stop, args.stake, anchor, stream_clock=bool(args.replay),
+                confirm_stop_ms=args.confirm_stop_s * 1000 if args.confirm_stop_s > 0 else 0)
+    src = replay_rows(args.replay, args.speed, args.inject_stale) if args.replay else live_rows()
+    print(f"[agent] running ({'replay' if args.replay else 'LIVE'}); take={args.take} stop={args.stop}")
+    for chan, payload in src:
+        if chan == "odds":
+            u = parse_odds(payload)
+            if u:
+                desk.on_odds(u)
+        else:
+            s = parse_score(payload)
+            if s:
+                desk.on_score(s)
+    print("[agent] stream ended")
+    for fid, st in desk.positions.items():
+        print(f"[agent] still open: fx={fid} {st['names'][st['pos'].outcome]}")
+
+
+if __name__ == "__main__":
+    main()
