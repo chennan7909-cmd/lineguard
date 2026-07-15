@@ -39,5 +39,6 @@ class Order:
     submit_ts: int
     legs: list = field(default_factory=list)
     state: str = "SUBMITTED"
+    rework_count: int = 0
 
 

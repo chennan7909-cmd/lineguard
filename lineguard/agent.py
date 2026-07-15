@@ -56,6 +56,8 @@ class Desk:
         self._repropose_after: dict = {}
         self.verifier = verifier          # callable(fixture_id, ts, message_id) -> verdict dict
         self._g6: dict = {}               # fixture -> True/False (cached spot-check)
+        self._reject_last: dict = {}      # (fixture, code) -> last anchored ts
+        self._reject_suppressed: dict = {}
         self.positions: dict = {}      # fixture -> {pos, opened_ts, names}
         self.locked: dict = {}         # fixture -> plan summary
         self.out = out
@@ -96,6 +98,20 @@ class Desk:
             print(f"[desk] restored from log: {restored} open, {len(self.locked)} locked")
 
     def decide(self, decision: dict):
+        act = decision.get("action", "")
+        if act.startswith("REJECT"):
+            key = (decision.get("fixture"), act)
+            now = decision.get("ts", 0)
+            last = self._reject_last.get(key)
+            if last is not None and now - last < 60_000:
+                self._reject_suppressed[key] = self._reject_suppressed.get(key, 0) + 1
+                decision["anchor"] = {"hash": None, "sig": None, "mode": "rate_limited",
+                                      "suppressed_in_window": self._reject_suppressed[key]}
+                self.fh.write(json.dumps(decision, ensure_ascii=False) + "\n")
+                self.fh.flush()
+                return
+            self._reject_last[key] = now
+            self._reject_suppressed[key] = 0
         try:
             res = self.anchor.anchor(decision)
         except Exception as e:   # anchoring must NEVER break the desk
@@ -163,6 +179,15 @@ class Desk:
                                        "position returned to book, re-propose after 120s"})
                 return
             if order.state == "SETTLED":
+                unfilled = [l for l in order.legs if l.filled < l.requested - 1e-9]
+                filled_any = any(l.filled > 1e-9 for l in order.legs)
+                if unfilled and filled_any and order.rework_count < 1:
+                    evs = self.executor.rework(order, u.decimal_odds, u.ts_ms)
+                    for ev in evs:
+                        self.decide({"action": "REWORK", "fixture": fid, "ts": u.ts_ms, **ev,
+                                     "detail": f"re-working leg {ev['leg']}: {ev['remaining']} remaining "
+                                               f"@ new baseline {ev['new_baseline_odds']}"})
+                    return
                 rec = self.executor.reconcile(order)
                 self.locked[fid] = {"floor": rec["realized_floor"]}
                 del self.pending[fid]

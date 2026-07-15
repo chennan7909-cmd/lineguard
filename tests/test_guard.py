@@ -36,3 +36,11 @@ def test_time_monotone():
     assert g.check(mk(Ts=2_000_000)).ok
     v = g.check(mk(Ts=1_500_000, MessageId="m3"))
     assert not v.ok and v.code in ("G1", "G5")
+
+
+def test_ms_jitter_tolerated_real_backwards_rejected():
+    g = FreshnessGuard(stream_clock=True)
+    assert g.check(mk(Ts=2_000_000)).ok
+    assert g.check(mk(Ts=2_000_000 - 12, MessageId="j1")).ok          # 12ms jitter: live-feed reality
+    v = g.check(mk(Ts=2_000_000 - 5_000, MessageId="j2"))              # 5s backwards: rejected
+    assert not v.ok and v.code in ("G1", "G5")

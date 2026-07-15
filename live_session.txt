@@ -1,0 +1,11 @@
+[agent] anchor: ON pubkey=23U7XbEWcPsY4ZU4FiwHUnobGFLdGomjBQsnT9AoZUra
+[agent] running (LIVE); take=8.0 stop=-15.0
+[desk] OPEN         fx=18237038 back part1 @ 2.745  ⚓r9xb8VGzZgpza7tV
+[desk] PROPOSED     fx=18237038 F_lock=-36.06 (stop) -> hedge proposed  ⚓4prh9ScXGdaaLSXH
+[desk] SUBMITTED    fx=18237038 2 leg(s) to venue (latency 800ms)  ⚓2QDQTBUzg9KTsh45
+[desk] FILLED       fx=18237038 leg->1 FILLED  ⚓Mzi11Sj921aic2zh
+[desk] PRICE_PROTECTION fx=18237038 leg->2 CANCELLED  ⚓4JQJH3tYj1votcBj
+[desk] RECONCILED   fx=18237038 realized_floor=-254.56 vs proposed=-36.06 (friction +218.50)  ⚓cWTsxMMYNVNMX8jD
+[desk] REJECT_G5    fx=18237038 time ran backwards 1784056991364 -> 1784056991363  ⚓2R48kbWkoZHEMv8h
+[desk] REJECT_G5    fx=18237038 time ran backwards 1784056992232 -> 1784056992230  ⚓5hJkdYULp87Uhqut
+[desk] REJECT_G5    fx=18237038 time ran backwards 1784058176590 -> 1784058176589  ⚓2mWoCp6EAvDi3zoG

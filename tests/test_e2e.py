@@ -26,6 +26,7 @@ def test_partial_fill_recalculates_remaining_risk(tmp_path):
     desk.on_odds(mk_odds(1, 1_000_000, (0.44, 0.28, 0.28), "m1"))
     desk.on_odds(mk_odds(1, 1_060_000, (0.58, 0.22, 0.20), "m2"))
     desk.on_odds(mk_odds(1, 1_061_000, (0.58, 0.22, 0.20), "m3"))
+    desk.on_odds(mk_odds(1, 1_062_500, (0.58, 0.22, 0.20), "m4"))
     rec = [d for d in decisions(tmp_path) if d["action"] == "RECONCILED"]
     assert rec, "expected reconciliation"
     r = rec[0]
@@ -55,10 +56,32 @@ def test_full_agent_lifecycle(tmp_path):
     desk.on_odds(mk_odds(9, t, (0.44, 0.28, 0.28), "s0"))            # position opens
     desk.on_odds(mk_odds(9, t + 60_000, (0.58, 0.22, 0.20), "s1"))    # sharp move, no goal
     desk.on_odds(mk_odds(9, t + 61_000, (0.58, 0.22, 0.20), "s2"))    # fills after latency
+    desk.on_odds(mk_odds(9, t + 62_500, (0.58, 0.22, 0.20), "s3"))    # rework pass completes
     ds = decisions(tmp_path)
     acts = [d["action"] for d in ds]
-    for expected in ("OPEN", "PROPOSED", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILED"):
+    for expected in ("OPEN", "PROPOSED", "SUBMITTED", "PARTIALLY_FILLED", "REWORK", "RECONCILED"):
         assert expected in acts, f"{expected} missing from {acts}"
     rec = next(d for d in ds if d["action"] == "RECONCILED")
     assert rec["realized_floor"] < rec["proposed_floor"]
     assert all(d["anchor"]["hash"] for d in ds)
+
+
+def test_rework_closes_residual_leg(tmp_path):
+    """One leg fills, the other is price-protected away -> REWORK resubmits the
+    remainder at current prices; reconciliation ends sane, not naked."""
+    desk = mk_desk(tmp_path, exec_cfg=ExecConfig(seed=4, fill_probability=1.0,
+                                                 quote_halt_prob=0.0, max_slippage_bps=0,
+                                                 latency_ms=800, price_protection_bps=150))
+    t = 1_000_000
+    desk.on_odds(mk_odds(3, t, (0.44, 0.28, 0.28), "w1"))
+    desk.on_odds(mk_odds(3, t + 60_000, (0.58, 0.22, 0.20), "w2"))      # trigger, propose @ these odds
+    # only outcome2 crashes beyond protection; outcome1 (draw) stays in band
+    desk.on_odds(mk_odds(3, t + 61_000, (0.5405, 0.2195, 0.24), "w3"))
+    acts = [d["action"] for d in decisions(tmp_path)]
+    assert "REWORK" in acts, acts
+    desk.on_odds(mk_odds(3, t + 62_500, (0.5405, 0.2195, 0.24), "w4"))  # rework fills after latency
+    ds = decisions(tmp_path)
+    rec = [d for d in ds if d["action"] == "RECONCILED"]
+    assert rec, [d["action"] for d in ds]
+    assert all(l["filled"] >= l["requested"] - 0.01 for l in rec[0]["legs"])
+    assert rec[0]["realized_floor"] > -100                               # exposure closed, not naked

@@ -62,6 +62,24 @@ class SimulatedExecutor:
                 order.state = "SETTLED_UNFILLED"
         return events
 
+    def rework(self, order: Order, odds_now, ts_ms: int) -> list[dict]:
+        """One re-work pass: resubmit unfilled remainders at CURRENT prices
+        (fresh price-protection baseline) instead of settling naked."""
+        events = []
+        for leg in order.legs:
+            if leg.filled < leg.requested - 1e-9 and leg.state in ("CANCELLED", "REJECTED", "PARTIALLY_FILLED"):
+                leg.state = "SUBMITTED"
+                leg.attempts = 0
+                leg.proposal_odds = odds_now[leg.outcome]
+                events.append({"leg": leg.outcome, "event": "REWORK",
+                               "remaining": round(leg.requested - leg.filled, 2),
+                               "new_baseline_odds": round(leg.proposal_odds, 3)})
+        if events:
+            order.state = "SUBMITTED"
+            order.submit_ts = ts_ms
+            order.rework_count += 1
+        return events
+
     @staticmethod
     def reconcile(order: Order) -> dict:   # kept for API compatibility
         return reconcile(order)

@@ -37,13 +37,14 @@ An autonomous agent can.
     RISK       three-outcome hedge engine. One closed form covers every intent:
         │        h_j = T·p_j,  T = (S+F)/q_i,  q_i = 1 − Σ_{j≠i} 1/o_j
         │      lock_profit floor: F_lock = S(a·q_i − 1)  — exact for ANY
-        ▼      overround, prices the house edge automatically. 41 tests incl. e2e.
+        ▼      overround, prices the house edge automatically. 47 tests incl. e2e.
     EXECUTE    full order lifecycle, not a theoretical hedge:
         │        PROPOSED → SUBMITTED → (latency, market moves) →
         │        FILLED / PARTIALLY_FILLED / REJECTED / CANCELLED → RECONCILED
         │      simulated venue with seeded, deterministic frictions: 800ms
         │      latency, ≤75bps slippage, 92% fill prob, per-leg liquidity cap,
-        │      quote halts, one retry. Reconciliation recomputes the TRUE floor
+        │      quote halts, one retry, and ONE re-work pass that resubmits unfilled remainders at
+        │      current prices instead of settling naked. Reconciliation recomputes the TRUE floor
         ▼      from actual fills — single-leg risk is measured, not assumed away.
     ANCHOR     every decision sha256-hashed + written as an SPL Memo on Solana
                devnet by the agent's own wallet. Audit trail survives the process.
@@ -64,7 +65,7 @@ An autonomous agent can.
     python -m lineguard.results --data data/ --output results/   # canonical results (JSON+CSV+PNG+MD)
     streamlit run lineguard/dashboard.py  # operator panel + explorer links
 
-    pytest -q                             # 41 tests, structured by layer:
+    pytest -q                             # 47 tests, structured by layer:
 
 | Module | File | What is tested |
 |---|---|---|

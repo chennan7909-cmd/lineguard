@@ -95,3 +95,22 @@ def test_sse_reconnect_writes_marker_and_recovers(tmp_path, monkeypatch):
     events = [l["event"] for l in lines]
     assert "_reconnect" in events, f"no reconnect marker in {events}"
     assert "odds" in events, "stream did not recover after reconnect"
+
+
+def test_reject_rate_limited_not_reanchored(tmp_path):
+    anchored = []
+    class CountingAnchor:
+        enabled = True
+        def anchor(self, d):
+            anchored.append(d["action"])
+            return {"hash": "h", "sig": "s", "mode": "live"}
+    desk = mk_desk(tmp_path, anchor=CountingAnchor())
+    base = mk_odds(1, 3_000_000, (0.44, 0.28, 0.28), "r0")
+    desk.on_odds(base)
+    for k in range(5):   # five stale packets in the same minute
+        desk.on_odds(mk_odds(1, 3_000_000 - 500_000, (0.44, 0.28, 0.28), f"r{k+1}"))
+    rejects_anchored = [a for a in anchored if a.startswith("REJECT")]
+    assert len(rejects_anchored) == 1                     # only the first hits the chain
+    ds = decisions(tmp_path)
+    assert sum(1 for d in ds if d["action"].startswith("REJECT")) == 5   # all logged locally
+    assert sum(1 for d in ds if (d.get("anchor") or {}).get("mode") == "rate_limited") == 4

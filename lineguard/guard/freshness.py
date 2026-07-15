@@ -30,11 +30,13 @@ class GuardVerdict:
 
 class FreshnessGuard:
     def __init__(self, max_age_ms: int = 90_000, demargin_tol: float = 0.01,
-                 consistency_tol: float = 0.02, stream_clock: bool = False):
+                 consistency_tol: float = 0.02, stream_clock: bool = False,
+                 out_of_order_tol_ms: int = 2_000):
         self.max_age_ms = max_age_ms
         self.demargin_tol = demargin_tol
         self.consistency_tol = consistency_tol
         self.stream_clock = stream_clock   # replay mode: compare against max Ts seen
+        self.out_of_order_tol_ms = out_of_order_tol_ms  # live feeds interleave with ms-level jitter
         self._max_ts: dict = {}
         self._last_ts: dict = {}
 
@@ -58,7 +60,8 @@ class FreshnessGuard:
             if abs(p - 1.0 / o) > self.consistency_tol:
                 return GuardVerdict(False, "G3", f"Pct {p:.4f} vs 1/odds {1/o:.4f} disagree")
         last = self._last_ts.get(key)
-        if last is not None and u.ts_ms < last:
-            return GuardVerdict(False, "G5", f"time ran backwards {last} -> {u.ts_ms}")
-        self._last_ts[key] = u.ts_ms
+        if last is not None and last - u.ts_ms > self.out_of_order_tol_ms:
+            return GuardVerdict(False, "G5", f"time ran backwards {last} -> {u.ts_ms} "
+                                             f"(> {self.out_of_order_tol_ms}ms tolerance)")
+        self._last_ts[key] = max(u.ts_ms, last or 0)
         return GuardVerdict(True, "PASS")
