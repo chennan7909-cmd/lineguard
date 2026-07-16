@@ -30,7 +30,7 @@
 
   const nodes = [
     { label: "TxLINE", sub: "Odds + Scores", state: "STREAMING", c: colors.blue },
-    { label: "Data Guard", sub: "5 Integrity Checks", state: "PASS", c: colors.teal },
+    { label: "Data Guard", sub: "5+1 Integrity Checks", state: "PASS", c: colors.teal },
     { label: "Signal", sub: "Move Attribution", state: "SHARP", c: colors.amber },
     { label: "Hedge", sub: "3-Way P/L Lock", state: "LOCK", c: colors.violet },
     { label: "Execution", sub: "Fill Lifecycle", state: "FILLED", c: colors.red },
@@ -212,33 +212,45 @@
   function drawGuardChecks(t) {
     const guard = nodes[1];
     const reveal = segment(t, 3.0, 3.45);
-    const collapse = segment(t, 6.25, 6.9);
+    const collapse = segment(t, 7.25, 7.95);
     const a = reveal * (1 - collapse);
     if (a <= 0.01) return;
 
-    const h = 122 * (1 - collapse) + 16 * collapse;
-    const x = guard.x - 26;
-    const y = guard.y - 166;
+    const h = 238 * (1 - collapse) + 16 * collapse;
+    const x = guard.x - 88;
+    const y = guard.y - 280;
+    const w = guard.w + 250;
     ctx.save();
     ctx.globalAlpha = a;
     ctx.fillStyle = colors.panel2;
-    roundedRect(x, y, guard.w + 52, h, 8);
+    roundedRect(x, y, w, h, 8);
     ctx.fill();
     ctx.strokeStyle = colors.teal;
     ctx.lineWidth = 2;
     ctx.stroke();
 
     if (collapse < 0.45) {
-      text("Data Guard checks", x + 22, y + 28, 22, colors.ink, 720);
-      ["Freshness", "Demargin", "Timestamp"].forEach((label, i) => {
+      text("5+1 INTEGRITY CHECKS", x + 22, y + 29, 21, colors.ink, 760);
+      text("CRYPTOGRAPHIC PROVENANCE", x + 22, y + 56, 13, colors.teal, 760);
+      const rows = [
+        ["G1", "Freshness", colors.pass],
+        ["G2", "Demargin consistency", colors.pass],
+        ["G3", "Price consistency", colors.pass],
+        ["G4", "Range sanity", colors.pass],
+        ["G5", "Timestamp monotonicity", colors.pass],
+        ["G6", "Merkle proof → on-chain validate_odds", colors.teal]
+      ];
+      rows.forEach(([code, label, accent], i) => {
         const rowA = segment(t, 3.45 + i * 0.55, 3.9 + i * 0.55);
+        const rowY = y + 86 + i * 24;
         ctx.globalAlpha = a * rowA;
-        ctx.fillStyle = colors.pass;
+        ctx.fillStyle = accent;
         ctx.beginPath();
-        ctx.arc(x + 27, y + 62 + i * 27, 7, 0, Math.PI * 2);
+        ctx.arc(x + 25, rowY, i === 5 ? 6 : 5.5, 0, Math.PI * 2);
         ctx.fill();
-        text(label, x + 43, y + 62 + i * 27, 18, colors.muted, 650);
-        text("PASS", x + guard.w + 19, y + 62 + i * 27, 18, colors.pass, 760, "right");
+        text(code, x + 43, rowY, 15, accent, 780);
+        text(label, x + 80, rowY, i === 5 ? 14 : 15, colors.muted, 650);
+        text("PASS", x + w - 18, rowY, 15, i === 5 ? colors.teal : colors.pass, 780, "right");
       });
     }
     ctx.restore();
