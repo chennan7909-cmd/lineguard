@@ -1,0 +1,14 @@
+{
+  "name": "lineguard-architecture-animation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "render": "node render.js",
+    "verify": "node verify.js",
+    "build": "npm run render && npm run verify"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}

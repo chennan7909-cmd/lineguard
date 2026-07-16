@@ -6,3 +6,15 @@ data/
 .txline_token.json
 *.env
 wallet.json
+
+# Demo media and local outputs
+*.mov
+*.mp4
+results/demo_results.png
+architecture/output/
+data/demo_*/
+
+# Local environment
+.env
+.DS_Store
+__pycache__/

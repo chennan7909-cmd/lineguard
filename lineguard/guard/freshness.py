@@ -28,6 +28,15 @@ class GuardVerdict:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class GuardDiagnostics:
+    freshness: bool
+    demargin_consistency: bool
+    price_consistency: bool
+    range_sanity: bool
+    timestamp_monotonic: bool
+
+
 class FreshnessGuard:
     def __init__(self, max_age_ms: int = 90_000, demargin_tol: float = 0.01,
                  consistency_tol: float = 0.02, stream_clock: bool = False,
@@ -39,28 +48,50 @@ class FreshnessGuard:
         self.out_of_order_tol_ms = out_of_order_tol_ms  # live feeds interleave with ms-level jitter
         self._max_ts: dict = {}
         self._last_ts: dict = {}
+        self.last_diagnostics = GuardDiagnostics(True, True, True, True, True)
 
     def check(self, u) -> GuardVerdict:
         key = (u.fixture_id, u.market)
         now_ms = self._max_ts.get("__global__", 0) if self.stream_clock else int(time.time() * 1000)
         self._max_ts["__global__"] = max(self._max_ts.get("__global__", 0), u.ts_ms)
 
+        range_sanity = len(u.probs) == 3 and len(u.decimal_odds) == 3
+        if range_sanity:
+            range_sanity = (
+                all(0.0 < p < 1.0 for p in u.probs)
+                and all(o > 1.0 for o in u.decimal_odds)
+            )
+        freshness = now_ms - u.ts_ms <= self.max_age_ms
+        s = sum(u.probs)
+        demargin_consistency = abs(s - 1.0) <= self.demargin_tol
+        price_consistency = (
+            len(u.probs) == len(u.decimal_odds)
+            and all(abs(p - 1.0 / o) <= self.consistency_tol for p, o in zip(u.probs, u.decimal_odds) if o)
+        )
+        last = self._last_ts.get(key)
+        timestamp_monotonic = last is None or last - u.ts_ms <= self.out_of_order_tol_ms
+        self.last_diagnostics = GuardDiagnostics(
+            freshness=freshness,
+            demargin_consistency=demargin_consistency,
+            price_consistency=price_consistency,
+            range_sanity=range_sanity,
+            timestamp_monotonic=timestamp_monotonic,
+        )
+
         if len(u.probs) != 3 or len(u.decimal_odds) != 3:
             return GuardVerdict(False, "G4", f"expected 3 outcomes, got {len(u.probs)}")
         if any(not (0.0 < p < 1.0) for p in u.probs) or any(o <= 1.0 for o in u.decimal_odds):
             return GuardVerdict(False, "G4", "prob/odds out of range")
-        if not self.stream_clock and now_ms - u.ts_ms > self.max_age_ms:
+        if not self.stream_clock and not freshness:
             return GuardVerdict(False, "G1", f"stale by {(now_ms - u.ts_ms)/1000:.1f}s")
-        if self.stream_clock and now_ms - u.ts_ms > self.max_age_ms:
+        if self.stream_clock and not freshness:
             return GuardVerdict(False, "G1", f"stale vs stream clock by {(now_ms - u.ts_ms)/1000:.1f}s")
-        s = sum(u.probs)
-        if abs(s - 1.0) > self.demargin_tol:
+        if not demargin_consistency:
             return GuardVerdict(False, "G2", f"prob sum {s:.4f} outside demargined band")
         for p, o in zip(u.probs, u.decimal_odds):
             if abs(p - 1.0 / o) > self.consistency_tol:
                 return GuardVerdict(False, "G3", f"Pct {p:.4f} vs 1/odds {1/o:.4f} disagree")
-        last = self._last_ts.get(key)
-        if last is not None and last - u.ts_ms > self.out_of_order_tol_ms:
+        if not timestamp_monotonic:
             return GuardVerdict(False, "G5", f"time ran backwards {last} -> {u.ts_ms} "
                                              f"(> {self.out_of_order_tol_ms}ms tolerance)")
         self._last_ts[key] = max(u.ts_ms, last or 0)
