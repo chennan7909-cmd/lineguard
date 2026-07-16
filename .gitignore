@@ -18,3 +18,12 @@ data/demo_*/
 .env
 .DS_Store
 __pycache__/
+
+# Local video production
+raw/
+output/
+video_sections/
+
+# Local browser/runtime dependencies
+architecture/node_modules/
+architecture/.ms-playwright/
