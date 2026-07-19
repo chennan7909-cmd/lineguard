@@ -91,3 +91,25 @@ An autonomous agent can.
   integration is out of scope and jurisdiction-dependent.
 - Entry policy (back the favorite at kickoff) is deliberately simple; the
   product is the risk layer, and it is strategy-agnostic.
+
+## Canonical Evaluation
+
+- 29 World Cup matches
+- 2,876,085 raw TxLINE odds rows
+- 176,286 deduplicated 1X2 updates
+- 328 detected signals
+- 64 automated tests
+
+## Current Scope
+
+- TxLINE odds and scores are consumed as live inputs.
+- LineGuard uses five operational integrity checks plus G6 cryptographic provenance verification.
+- Execution is simulated in the current build.
+- Solana devnet is used for signed decision-audit anchoring, not bet execution.
+- Evaluation results demonstrate risk reduction, not guaranteed profitability.
+
+## Demo and Access
+
+- Live MVP: https://lineguard-txline.streamlit.app
+- Demo video: https://youtu.be/jcLP2G3b6ng
+- Technical documentation: [docs/TECHNICAL_DOC.md](docs/TECHNICAL_DOC.md)

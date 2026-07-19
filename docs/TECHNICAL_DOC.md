@@ -67,3 +67,30 @@ book. The demargined StablePrice feed makes the closed forms exact; a
 Paper positions only — no real bets, no custody, no venue execution.
 The entry policy (back the favorite at kickoff) is deliberately simple;
 the product is the risk layer, not the alpha.
+
+## Validation Architecture
+
+LineGuard applies five operational integrity checks:
+
+- G1 Freshness
+- G2 Demargin consistency
+- G3 Price consistency
+- G4 Range sanity
+- G5 Timestamp monotonicity
+
+G6 adds cryptographic provenance verification through a Merkle proof spot-check against TxLINE's on-chain `validate_odds` view.
+
+## Evaluation
+
+- 29 matches
+- 2,876,085 raw TxLINE odds rows
+- 176,286 deduplicated 1X2 updates
+- 328 detected signals
+- 64 automated tests
+
+## Current Limitations and Scope
+
+- Execution is simulated.
+- Solana devnet is used for signed decision-audit anchoring, not wager execution.
+- The current evaluation covers football data only.
+- Reported results are risk-control outcomes, not guaranteed profitability.

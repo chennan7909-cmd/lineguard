@@ -27,3 +27,11 @@ video_sections/
 # Local browser/runtime dependencies
 architecture/node_modules/
 architecture/.ms-playwright/
+
+# Local demo production helpers
+architecture/README.md
+architecture/index.html
+scripts/build_technical_demo.py
+scripts/build_technical_demo_v2.py
+scripts/build_technical_demo_v2_1.py
+tools/render_opening_keynote_overlay.py
