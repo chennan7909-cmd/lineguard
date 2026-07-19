@@ -23,8 +23,12 @@ independently of this process.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import glob
 import json
+import os
+import re
+import threading
 import time
 from pathlib import Path
 
@@ -32,18 +36,257 @@ import httpx
 
 from .chain.anchor import Anchor
 from .execution import ExecConfig, SimulatedExecutor
-from .guard.freshness import FreshnessGuard
+from .guard.freshness import FreshnessGuard, GuardDiagnostics
 from .risk.hedge import Position, lock_profit, locked_pnl
-from .signal.detector import DetectorConfig, MovementDetector
+from .signal.detector import DetectorConfig, MovementDetector, SignalCandidate
 from .txline.auth import ORIGIN, get_credentials
 from .txline.normalize import MARKET_1X2, parse_odds, parse_score
+
+
+SECRET_KEYS = ("TOKEN", "JWT", "SECRET", "PRIVATE", "SEED", "AUTHORIZATION")
+COMPACT_OBSERVABILITY_ACTIONS = {"HOLD", "PROPOSED", "REFUSED"}
+
+
+def _utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _fixture_id(payload: dict) -> int | None:
+    for key in ("FixtureId", "fixtureId", "id", "Id"):
+        try:
+            if payload.get(key) is not None:
+                return int(payload[key])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _is_active_fixture(fx: dict) -> bool:
+    if fx.get("InRunning") is True or fx.get("inRunning") is True:
+        return True
+    state = str(fx.get("GameState") or fx.get("gameState") or fx.get("Status") or fx.get("status") or "").lower()
+    return state in {"live", "inrunning", "in_running", "running", "started", "1h", "2h", "ht", "et", "pen"}
+
+
+def _fixture_rows(data) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("fixtures", "Fixtures", "data", "Data", "items", "Items"):
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return rows
+    return []
+
+
+def _secret_values() -> list[str]:
+    vals = []
+    for key, val in os.environ.items():
+        if val and len(val) >= 6 and any(marker in key.upper() for marker in SECRET_KEYS):
+            vals.append(val)
+    return vals
+
+
+def redact_secrets(text: object) -> str:
+    out = str(text)
+    for val in _secret_values():
+        out = out.replace(val, "[redacted]")
+    out = re.sub(r"(Authorization['\"]?\s*[:=]\s*['\"]?Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", out, flags=re.I)
+    out = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", out, flags=re.I)
+    out = re.sub(r"((?:X-Api-Token|api[_ -]?token|jwt|private[_ -]?key|seed(?: phrase)?)['\"]?\s*[:=]\s*['\"]?)[^,'\"\s}]+", r"\1[redacted]", out, flags=re.I)
+    return out
+
+
+def _pass_fail(ok: bool) -> str:
+    return "PASS" if ok else "FAIL"
+
+
+def _format_metric(value: float | None, places: int, signed: bool = False) -> str:
+    if value is None:
+        return "n/a"
+    prefix = "+" if signed else ""
+    return f"{value:{prefix}.{places}f}"
+
+
+def _signal_classification(candidate: SignalCandidate | None) -> str:
+    if candidate is None or not candidate.fired:
+        return "NO SIGNAL"
+    return "EVENT-DRIVEN" if candidate.recent_score_event else "NON-SCORE SHARP"
+
+
+def format_compact_observability(guard: GuardDiagnostics,
+                                 candidate: SignalCandidate | None) -> str:
+    return "\n".join([
+        "DATA GUARD",
+        f"{'Freshness':<22}{_pass_fail(guard.freshness)}",
+        f"{'Demargin consistency':<22}{_pass_fail(guard.demargin_consistency)}",
+        f"{'Price consistency':<22}{_pass_fail(guard.price_consistency)}",
+        f"{'Range sanity':<22}{_pass_fail(guard.range_sanity)}",
+        f"{'Timestamp monotonic':<22}{_pass_fail(guard.timestamp_monotonic)}",
+        "",
+        "SIGNAL",
+        f"{'Probability move':<22}{_format_metric(candidate.probability_move if candidate else None, 4, True)}",
+        f"{'Rolling z-score':<22}{_format_metric(candidate.z if candidate else None, 2)}",
+        f"{'Recent score event':<22}{'YES' if candidate and candidate.recent_score_event else 'NO'}",
+        f"{'Classification':<22}{_signal_classification(candidate)}",
+    ])
+
+
+def format_compact_stale_refusal(reason: str, position_unchanged: bool,
+                                 orders_submitted: int) -> str:
+    return "\n".join([
+        "STALE INPUT REFUSED",
+        f"{'Guard check':<22}Freshness",
+        f"{'Reason':<22}{reason}",
+        f"{'Decision':<22}REFUSED",
+        f"{'Position state':<22}{'UNCHANGED' if position_unchanged else 'CHANGED'}",
+        f"{'Orders submitted':<22}{orders_submitted}",
+    ])
+
+
+class LiveObserver:
+    def __init__(self, display: str = "normal", heartbeat_s: float = 15.0):
+        self.display = display
+        self.heartbeat_s = heartbeat_s
+        self.txline_auth = "CONNECTING"
+        self.fixture_snapshot = "REQUESTING"
+        self.odds_sse = "CONNECTING"
+        self.scores_sse = "CONNECTING"
+        self.anchor_wallet = "READY"
+        self.active_fixtures: set[int] = set()
+        self.open_positions = 0
+        self.last_odds_at: float | None = None
+        self.last_score_at: float | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def _label(self, field: str) -> str:
+        return {
+            "txline_auth": "TxLINE auth",
+            "fixture_snapshot": "Fixture snapshot",
+            "odds_sse": "Odds SSE",
+            "scores_sse": "Scores SSE",
+            "anchor_wallet": "Anchor wallet",
+        }.get(field, field)
+
+    def set_anchor(self, anchor: Anchor) -> None:
+        with self._lock:
+            self.anchor_wallet = "READY" if anchor.enabled else "FAILED"
+
+    def set_state(self, field: str, state: str, detail: str | None = None) -> None:
+        with self._lock:
+            setattr(self, field, state)
+        if self.display == "debug" and detail:
+            print(f"[live:debug] {field}={state} {redact_secrets(detail)}")
+        if self.display == "normal":
+            self.print_panel()
+        elif self.display == "compact":
+            print(f"{self._label(field):<21}{state}")
+
+    def set_fixture_snapshot(self, state: str, rows=None) -> None:
+        active = set()
+        for fx in rows or []:
+            if isinstance(fx, dict) and _is_active_fixture(fx):
+                fid = _fixture_id(fx)
+                if fid is not None:
+                    active.add(fid)
+        with self._lock:
+            self.fixture_snapshot = state
+            self.active_fixtures = active
+        if self.display == "normal":
+            self.print_panel()
+        elif self.display == "compact":
+            print(f"{self._label('fixture_snapshot'):<21}{state}")
+            print(f"{'Active fixtures':<21}{len(active)}")
+            print(f"{'Agent status':<21}{'MONITORING' if active else 'WAITING FOR ACTIVE FIXTURES'}")
+
+    def note_event(self, channel: str, payload: dict, open_positions: int) -> None:
+        fid = _fixture_id(payload)
+        now = time.time()
+        with self._lock:
+            if channel == "odds":
+                self.last_odds_at = now
+                if payload.get("InRunning") is True and fid is not None:
+                    self.active_fixtures.add(fid)
+            else:
+                self.last_score_at = now
+                if fid is not None:
+                    self.active_fixtures.add(fid)
+            self.open_positions = open_positions
+        if fid is None:
+            fid = "?"
+        print(f"[txline:{channel[:-1] if channel.endswith('s') else channel}] fixture={fid} received_at={_utc_now_iso()}")
+
+    def note_open_positions(self, count: int) -> None:
+        with self._lock:
+            self.open_positions = count
+
+    def agent_status(self) -> str:
+        with self._lock:
+            return "MONITORING" if self.active_fixtures else "WAITING FOR ACTIVE FIXTURES"
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "txline_auth": self.txline_auth,
+                "fixture_snapshot": self.fixture_snapshot,
+                "odds_sse": self.odds_sse,
+                "scores_sse": self.scores_sse,
+                "anchor_wallet": self.anchor_wallet,
+                "active_fixtures": len(self.active_fixtures),
+                "open_positions": self.open_positions,
+                "last_odds_at": self.last_odds_at,
+                "last_score_at": self.last_score_at,
+            }
+
+    def print_header(self) -> None:
+        print("LINEGUARD / LIVE")
+        print("────────────────────────────────")
+        self.print_panel()
+
+    def print_panel(self) -> None:
+        s = self.snapshot()
+        rows = [
+            ("TxLINE auth", s["txline_auth"]),
+            ("Fixture snapshot", s["fixture_snapshot"]),
+            ("Odds SSE", s["odds_sse"]),
+            ("Scores SSE", s["scores_sse"]),
+            ("Anchor wallet", s["anchor_wallet"]),
+            ("Active fixtures", str(s["active_fixtures"])),
+            ("Open positions", str(s["open_positions"])),
+            ("Agent status", "MONITORING" if s["active_fixtures"] else "WAITING FOR ACTIVE FIXTURES"),
+        ]
+        for label, value in rows:
+            print(f"{label:<21}{value}")
+
+    def heartbeat_line(self, now: float | None = None) -> str:
+        now = time.time() if now is None else now
+        s = self.snapshot()
+
+        def age(ts):
+            return "never" if ts is None else f"{max(0, int(now - ts))}s"
+
+        return (
+            f"[heartbeat] odds={s['odds_sse']} scores={s['scores_sse']} "
+            f"fixtures={s['active_fixtures']} last_odds={age(s['last_odds_at'])} "
+            f"last_score={age(s['last_score_at'])}"
+        )
+
+    def start_heartbeat(self) -> None:
+        def run():
+            while not self._stop.wait(self.heartbeat_s):
+                print(self.heartbeat_line())
+        threading.Thread(target=run, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 class Desk:
     def __init__(self, out: Path, take: float, stop: float, stake: float, anchor: Anchor,
                  stream_clock: bool, confirm_stop_ms: int = 240_000,
                  exec_cfg: ExecConfig | None = None, exec_mode: str = "simulated",
-                 verifier=None):
+                 verifier=None, display: str = "normal"):
         self.guard = FreshnessGuard(stream_clock=stream_clock)
         self.detector = MovementDetector(DetectorConfig())
         self.anchor = anchor
@@ -51,6 +294,7 @@ class Desk:
         self.confirm_stop_ms = confirm_stop_ms
         self._held_through: dict = {}
         self.exec_mode = exec_mode
+        self.display = display
         self.executor = SimulatedExecutor(exec_cfg)
         self.pending: dict = {}       # fixture -> Order
         self._repropose_after: dict = {}
@@ -63,6 +307,7 @@ class Desk:
         self.out = out
         self.fh = open(out / "decisions.jsonl", "a", encoding="utf-8")
         self.seen: set = set()
+        self._compact_observed: set = set()
         self._restore(out / "decisions.jsonl")
 
     def _restore(self, path: Path):
@@ -123,6 +368,58 @@ class Desk:
         print(f"[desk] {decision['action']:<12} fx={decision.get('fixture')} "
               f"{decision.get('detail','')}  ⚓{sig}")
 
+    def _candidate_for(self, outcome: int | None) -> SignalCandidate | None:
+        candidates = self.detector.last_candidates
+        if outcome is not None:
+            for candidate in candidates:
+                if candidate.outcome == outcome:
+                    return candidate
+        fired = [candidate for candidate in candidates if candidate.fired]
+        if fired:
+            return max(fired, key=lambda candidate: candidate.z)
+        if candidates:
+            return max(candidates, key=lambda candidate: candidate.z)
+        return None
+
+    def _print_compact_observability(self, candidate: SignalCandidate | None) -> None:
+        if self.display != "compact":
+            return
+        key = None
+        if candidate is not None:
+            key = (candidate.fixture_id, candidate.ts_ms, candidate.outcome)
+            if key in self._compact_observed:
+                return
+            self._compact_observed.add(key)
+        print(format_compact_observability(self.guard.last_diagnostics, candidate))
+
+    def _decide_with_compact_observability(self, decision: dict,
+                                           candidate: SignalCandidate | None) -> None:
+        if decision.get("action") in COMPACT_OBSERVABILITY_ACTIONS:
+            self._print_compact_observability(candidate)
+        self.decide(decision)
+
+    def _position_state_signature(self) -> tuple:
+        positions = tuple(sorted(
+            (fid, st["pos"].outcome, st["pos"].stake, st["pos"].entry_odds)
+            for fid, st in self.positions.items()
+        ))
+        pending = tuple(sorted(self.pending.keys()))
+        locked = tuple(sorted(
+            (fid, tuple(sorted(summary.items())))
+            for fid, summary in self.locked.items()
+        ))
+        return positions, pending, locked
+
+    def _print_compact_stale_refusal(self, reason: str, state_before: tuple,
+                                     pending_before: int) -> None:
+        if self.display != "compact":
+            return
+        print(format_compact_stale_refusal(
+            reason,
+            self._position_state_signature() == state_before,
+            max(0, len(self.pending) - pending_before),
+        ))
+
     def on_score(self, s):
         self.detector.note_score_event(s.fixture_id, s.ts_ms, s.action)
 
@@ -130,8 +427,12 @@ class Desk:
         if u.market != MARKET_1X2 or u.message_id in self.seen:
             return
         self.seen.add(u.message_id)
+        state_before_guard = self._position_state_signature()
+        pending_before_guard = len(self.pending)
         v = self.guard.check(u)
         if not v.ok:
+            if v.code == "G1":
+                self._print_compact_stale_refusal(v.detail, state_before_guard, pending_before_guard)
             self.decide({"action": f"REJECT_{v.code}", "fixture": u.fixture_id,
                          "ts": u.ts_ms, "detail": v.detail})
             return
@@ -208,9 +509,12 @@ class Desk:
                 # adverse spike with NO score event: evidence says it reverts -> HOLD
                 if not self._held_through.get(fid):
                     self._held_through[fid] = True
-                    self.decide({"action": "HOLD", "fixture": fid, "ts": u.ts_ms,
-                                 "detail": f"F_lock={f:+.2f} < stop but unattributed (no score event "
-                                           f"within {self.confirm_stop_ms//1000}s) — spikes revert, holding"})
+                    self._decide_with_compact_observability(
+                        {"action": "HOLD", "fixture": fid, "ts": u.ts_ms,
+                         "detail": f"F_lock={f:+.2f} < stop but unattributed (no score event "
+                                   f"within {self.confirm_stop_ms//1000}s) — spikes revert, holding"},
+                        self._candidate_for(pos.outcome),
+                    )
                 return
         if u.ts_ms < self._repropose_after.get(fid, 0):
             return
@@ -229,15 +533,33 @@ class Desk:
             order = self.executor.submit(fid, pos, plan, u.ts_ms, odds_at_proposal=u.decimal_odds)
             self.pending[fid] = (order, st)
             del self.positions[fid]
-            self.decide({"action": "PROPOSED", "fixture": fid, "ts": u.ts_ms,
-                         "intent": plan.intent, "reason": reason,
-                         "proposed_floor": round(plan.floor, 2),
-                         "hedge_stakes": [round(h, 2) for h in plan.hedge_stakes],
-                         "exec_config": self.executor.cfg.as_dict(),
-                         "detail": f"F_lock={plan.floor:+.2f} ({reason}) -> hedge proposed"})
+            self._decide_with_compact_observability(
+                {"action": "PROPOSED", "fixture": fid, "ts": u.ts_ms,
+                 "intent": plan.intent, "reason": reason,
+                 "proposed_floor": round(plan.floor, 2),
+                 "hedge_stakes": [round(h, 2) for h in plan.hedge_stakes],
+                 "exec_config": self.executor.cfg.as_dict(),
+                 "detail": f"F_lock={plan.floor:+.2f} ({reason}) -> hedge proposed"},
+                self._candidate_for(pos.outcome),
+            )
             self.decide({"action": "SUBMITTED", "fixture": fid, "ts": u.ts_ms,
                          "legs": [{"outcome": l.outcome, "stake": round(l.requested, 2)} for l in order.legs],
                          "detail": f"{len(order.legs)} leg(s) to venue (latency {self.executor.cfg.latency_ms}ms)"})
+
+
+def _inject_stale_replay_packet(rows: list) -> None:
+    max_age_ms = FreshnessGuard().max_age_ms
+    for idx, (arrival_ts, chan, payload) in enumerate(rows):
+        if chan != "odds":
+            continue
+        u = parse_odds(payload)
+        if u is None or u.market != MARKET_1X2:
+            continue
+        stale = json.loads(json.dumps(payload))
+        stale["Ts"] = u.ts_ms - max_age_ms - 1_000
+        stale["MessageId"] = f"INJECTED_STALE_DEMO:{u.message_id}"
+        rows.insert(idx + 1, (arrival_ts, chan, stale))
+        return
 
 
 def replay_rows(patterns, speed, inject_stale=False):
@@ -250,12 +572,7 @@ def replay_rows(patterns, speed, inject_stale=False):
             rows.append((rec["payload"].get("Ts", 0), chan, rec["payload"]))
     rows.sort(key=lambda r: r[0])
     if inject_stale and rows:
-        mid = len(rows) // 2
-        ts_mid = rows[mid][0]
-        bad = dict(rows[mid][2]); bad = json.loads(json.dumps(bad))
-        bad["Ts"] = ts_mid - 9_000_000
-        bad["MessageId"] = "INJECTED_STALE_DEMO"
-        rows.insert(mid, (ts_mid, rows[mid][1], bad))   # arrives NOW, stamped 2.5h ago
+        _inject_stale_replay_packet(rows)
     prev = None
     for ts, chan, payload in rows:
         real_ts = payload.get("Ts", ts)
@@ -265,26 +582,77 @@ def replay_rows(patterns, speed, inject_stale=False):
         yield chan, payload
 
 
-def live_rows():
+def _fetch_fixture_snapshot(creds, observer: LiveObserver):
+    observer.set_state("fixture_snapshot", "REQUESTING")
+    with httpx.Client(timeout=20) as client:
+        r = client.get(f"{ORIGIN}/api/fixtures/snapshot", headers=creds.headers())
+        if r.status_code in (401, 403):
+            creds.renew_jwt()
+            r = client.get(f"{ORIGIN}/api/fixtures/snapshot", headers=creds.headers())
+        if r.status_code != 200:
+            observer.set_state("fixture_snapshot", "FAILED", f"status={r.status_code}")
+            return []
+        data = r.json()
+        rows = _fixture_rows(data)
+        observer.set_fixture_snapshot("OK" if rows else "EMPTY", rows)
+        return rows
+
+
+def _validate_sse_response(resp: httpx.Response) -> None:
+    if resp.status_code in (401, 403):
+        raise PermissionError(str(resp.status_code))
+    resp.raise_for_status()
+    ctype = resp.headers.get("content-type", "")
+    if ctype and "text/event-stream" not in ctype.lower():
+        raise RuntimeError(f"unexpected content-type {ctype}")
+
+
+def live_rows(observer: LiveObserver | None = None):
     from .txline.recorder import _iter_sse_lines
-    creds = get_credentials()
     import threading, queue
+    observer = observer or LiveObserver()
+    observer.set_state("txline_auth", "CONNECTING")
+    try:
+        creds = get_credentials()
+    except BaseException as e:
+        observer.set_state("txline_auth", "FAILED", f"{type(e).__name__}: {e}")
+        raise
+    try:
+        creds.headers()
+    except Exception as e:
+        observer.set_state("txline_auth", "FAILED", f"{type(e).__name__}: {e}")
+        raise
+    observer.set_state("txline_auth", "OK")
+    try:
+        _fetch_fixture_snapshot(creds, observer)
+    except Exception as e:
+        observer.set_state("fixture_snapshot", "FAILED", f"{type(e).__name__}: {e}")
     q: "queue.Queue" = queue.Queue()
 
     def pump(channel):
+        field = "odds_sse" if channel == "odds" else "scores_sse"
         while True:
             try:
+                observer.set_state(field, "CONNECTING")
                 with httpx.Client(timeout=httpx.Timeout(10, read=120)) as client:
                     with client.stream("GET", f"{ORIGIN}/api/{channel}/stream",
                                        headers={**creds.headers(), "Accept": "text/event-stream"}) as resp:
-                        if resp.status_code in (401, 403):
-                            creds.renew_jwt(); continue
+                        try:
+                            _validate_sse_response(resp)
+                        except PermissionError:
+                            creds.renew_jwt()
+                            observer.set_state(field, "RETRYING", f"status={resp.status_code} jwt_renewed=true")
+                            continue
+                        observer.set_state(field, "CONNECTED", f"status={resp.status_code}")
                         for msg in _iter_sse_lines(resp):
                             try:
-                                q.put((channel, json.loads(msg["data"])))
+                                payload = json.loads(msg["data"])
+                                q.put((channel, payload))
                             except (json.JSONDecodeError, TypeError):
                                 pass
-            except Exception:
+            except Exception as e:
+                observer.set_state(field, "FAILED", f"{type(e).__name__}: {e}")
+                observer.set_state(field, "RETRYING")
                 time.sleep(2)
 
     for ch in ("odds", "scores"):
@@ -311,13 +679,19 @@ def main():
     ap.add_argument("--exec-fill-prob", type=float, default=0.92)
     ap.add_argument("--exec-liquidity", type=float, default=5000.0)
     ap.add_argument("--exec-seed", type=int, default=7)
+    ap.add_argument("--display", choices=["normal", "compact", "debug"], default="normal")
     ap.add_argument("--verify-anchor", action="store_true",
                     help="G6: cryptographic Merkle spot-check per fixture before opening (validate_odds on-chain view)")
     args = ap.parse_args()
 
     out = Path(args.out); out.mkdir(exist_ok=True)
     anchor = Anchor()
-    print(f"[agent] anchor: {'ON pubkey=' + anchor.pubkey if anchor.enabled else getattr(anchor, 'reason', 'off')}")
+    observer = LiveObserver(args.display) if not args.replay else None
+    if observer:
+        observer.set_anchor(anchor)
+        observer.print_header()
+    else:
+        print(f"[agent] anchor: {'ON pubkey=' + anchor.pubkey if anchor.enabled else getattr(anchor, 'reason', 'off')}")
     exec_cfg = ExecConfig(latency_ms=args.exec_latency_ms, max_slippage_bps=args.exec_slippage_bps,
                           fill_probability=args.exec_fill_prob, max_leg_liquidity=args.exec_liquidity,
                           seed=args.exec_seed)
@@ -328,10 +702,16 @@ def main():
         verifier = lambda fid, ts, mid: verify_update(creds_v, fixture_id=fid, ts=ts, message_id=mid)
     desk = Desk(out, args.take, args.stop, args.stake, anchor, stream_clock=bool(args.replay),
                 confirm_stop_ms=args.confirm_stop_s * 1000 if args.confirm_stop_s > 0 else 0,
-                exec_cfg=exec_cfg, exec_mode=args.exec_mode, verifier=verifier)
-    src = replay_rows(args.replay, args.speed, args.inject_stale) if args.replay else live_rows()
+                exec_cfg=exec_cfg, exec_mode=args.exec_mode, verifier=verifier,
+                display=args.display)
+    if observer:
+        observer.note_open_positions(len(desk.positions) + len(desk.pending))
+        observer.start_heartbeat()
+    src = replay_rows(args.replay, args.speed, args.inject_stale) if args.replay else live_rows(observer)
     print(f"[agent] running ({'replay' if args.replay else 'LIVE'}); take={args.take} stop={args.stop}")
     for chan, payload in src:
+        if observer:
+            observer.note_event(chan, payload, len(desk.positions) + len(desk.pending))
         if chan == "odds":
             u = parse_odds(payload)
             if u:
@@ -340,6 +720,8 @@ def main():
             s = parse_score(payload)
             if s:
                 desk.on_score(s)
+        if observer:
+            observer.note_open_positions(len(desk.positions) + len(desk.pending))
     print("[agent] stream ended")
     for fid, st in desk.positions.items():
         print(f"[agent] still open: fx={fid} {st['names'][st['pos'].outcome]}")

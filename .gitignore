@@ -6,3 +6,32 @@ data/
 .txline_token.json
 *.env
 wallet.json
+
+# Demo media and local outputs
+*.mov
+*.mp4
+results/demo_results.png
+architecture/output/
+data/demo_*/
+
+# Local environment
+.env
+.DS_Store
+__pycache__/
+
+# Local video production
+raw/
+output/
+video_sections/
+
+# Local browser/runtime dependencies
+architecture/node_modules/
+architecture/.ms-playwright/
+
+# Local demo production helpers
+architecture/README.md
+architecture/index.html
+scripts/build_technical_demo.py
+scripts/build_technical_demo_v2.py
+scripts/build_technical_demo_v2_1.py
+tools/render_opening_keynote_overlay.py

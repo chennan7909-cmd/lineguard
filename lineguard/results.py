@@ -179,8 +179,7 @@ def main():
         ax.plot(decay["minutes"], decay["sharp_only"], marker="s", label="sharp (no score event)")
         ax.axhline(0, lw=0.8, color="gray")
         ax.set_xlabel("minutes after signal"); ax.set_ylabel("avg lockable P/L per 100 stake")
-        ax.set_title(f"Spikes are ephemeral (n={len(rows)} signals, {matches_used} matches, "
-                     f"margin={args.margin:.0%})")
+        ax.set_title("Lockable value decays rapidly after the signal")
         ax.legend(); fig.tight_layout(); fig.savefig(out / "decay_curve.png", dpi=150)
 
         rows_t = sorted(rows, key=lambda r: r["ts_ms"])

@@ -35,6 +35,20 @@ class Signal:
     odds_at_signal: tuple
 
 
+@dataclass(frozen=True)
+class SignalCandidate:
+    fixture_id: int
+    ts_ms: int
+    outcome: int
+    outcome_name: str
+    prob_before: float
+    prob_after: float
+    probability_move: float
+    z: float
+    recent_score_event: bool
+    fired: bool
+
+
 @dataclass
 class DetectorConfig:
     lookback_ms: int = 15 * 60_000
@@ -51,6 +65,7 @@ class MovementDetector:
         self._win: dict = defaultdict(deque)          # (fid, outcome) -> deque[(ts, prob)]
         self._cooldown_until: dict = defaultdict(int)  # (fid, outcome) -> ts
         self._last_event_ts: dict = defaultdict(int)   # fid -> ts of last score event
+        self.last_candidates: list[SignalCandidate] = []
 
     def note_score_event(self, fixture_id: int, ts_ms: int, action: str) -> None:
         if action not in ("connected", "disconnected", "heartbeat", ""):
@@ -59,6 +74,7 @@ class MovementDetector:
     def on_odds(self, u) -> list:
         """Feed one normalized 1X2 OddsUpdate; returns 0..n Signals."""
         out = []
+        candidates = []
         for i, prob in enumerate(u.probs):
             key = (u.fixture_id, i)
             win = self._win[key]
@@ -72,15 +88,24 @@ class MovementDetector:
             mean = statistics.fmean(baseline)
             std = statistics.pstdev(baseline)
             delta = prob - mean
+            z = abs(delta) / std if std >= 1e-9 else 0.0
+            ev = (u.ts_ms - self._last_event_ts[u.fixture_id]) <= self.cfg.event_window_ms
+            name = u.outcome_names[i] if i < len(u.outcome_names) else str(i)
+            fires = (
+                delta >= self.cfg.delta_min
+                and z >= self.cfg.z_min
+                and u.ts_ms >= self._cooldown_until[key]
+            )
+            candidates.append(SignalCandidate(u.fixture_id, u.ts_ms, i, name, mean, prob,
+                                              delta, z, ev, fires))
             if delta < self.cfg.delta_min:      # shortening side only
                 continue
-            if std < 1e-9 or abs(delta) / std < self.cfg.z_min:
+            if std < 1e-9 or z < self.cfg.z_min:
                 continue
             if u.ts_ms < self._cooldown_until[key]:
                 continue
             self._cooldown_until[key] = u.ts_ms + self.cfg.cooldown_ms
-            ev = (u.ts_ms - self._last_event_ts[u.fixture_id]) <= self.cfg.event_window_ms
-            name = u.outcome_names[i] if i < len(u.outcome_names) else str(i)
             out.append(Signal(u.fixture_id, u.ts_ms, i, name, mean, prob,
-                              abs(delta) / std, u.in_running, ev, u.decimal_odds))
+                              z, u.in_running, ev, u.decimal_odds))
+        self.last_candidates = candidates
         return out
